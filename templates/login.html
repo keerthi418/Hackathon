@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LabTrace · Secure Login</title>
+  <link rel="stylesheet" href="/static/css/app.css" />
+</head>
+<body class="auth-page">
+  <div class="auth-bg"></div>
+  <div class="auth-card">
+    <div class="auth-logo">
+      <span class="logo-icon">◈</span>
+      <div>
+        <h1>LabTrace</h1>
+        <p class="tagline">LogLens · Evidence-First Access Alerts</p>
+      </div>
+    </div>
+
+    <div class="auth-badge">SECURE SESSION · LOCAL ONLY</div>
+
+    <form id="loginForm" class="auth-form">
+      <div class="field">
+        <label for="username">Operator ID</label>
+        <input id="username" type="text" autocomplete="username" required placeholder="username" />
+      </div>
+      <div class="field">
+        <label for="password">Passphrase</label>
+        <input id="password" type="password" autocomplete="current-password" required placeholder="••••••••" />
+      </div>
+      <div id="loginError" class="error-msg hidden"></div>
+      <button type="submit" class="btn btn-primary btn-block" id="loginBtn">
+        Authenticate Session
+      </button>
+    </form>
+
+    <div class="auth-links">
+      <a href="/register">Create Account</a>
+      <span>·</span>
+      <a href="/forgot-password">Forgot Password</a>
+    </div>
+
+    <div class="login-hint">
+      <p><strong>Demo credentials</strong></p>
+      <code>admin</code> / <code>LabTrace@2025</code><br/>
+      <code>analyst</code> / <code>Analyst@2025</code>
+    </div>
+
+    <p class="secure-note">
+      🔒 Flask · bcrypt · SQLite · Session · 2FA (TOTP) · NO CLOUD
+    </p>
+  </div>
+
+  <script>
+    document.getElementById('loginForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const err = document.getElementById('loginError');
+      const btn = document.getElementById('loginBtn');
+      err.classList.add('hidden');
+      btn.disabled = true;
+      btn.textContent = 'Verifying credentials…';
+      try {
+        const res = await fetch('/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: document.getElementById('username').value.trim(),
+            password: document.getElementById('password').value,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Authentication failed');
+        if (data.need_2fa) {
+          window.location.href = '/2fa/verify';
+        } else {
+          window.location.href = '/dashboard';
+        }
+      } catch (ex) {
+        err.textContent = ex.message;
+        err.classList.remove('hidden');
+        btn.disabled = false;
+        btn.textContent = 'Authenticate Session';
+      }
+    });
+  </script>
+</body>
+</html>

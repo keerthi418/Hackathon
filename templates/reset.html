@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LabTrace · Reset Password</title>
+  <link rel="stylesheet" href="/static/css/app.css" />
+</head>
+<body class="auth-page">
+  <div class="auth-bg"></div>
+  <div class="auth-card">
+    <div class="auth-logo">
+      <span class="logo-icon">◈</span>
+      <div>
+        <h1>Reset Password</h1>
+        <p class="tagline">Use the token from Forgot Password</p>
+      </div>
+    </div>
+
+    <form id="resetForm" class="auth-form">
+      <div class="field">
+        <label for="username">Username</label>
+        <input id="username" type="text" required />
+      </div>
+      <div class="field">
+        <label for="token">Reset Token</label>
+        <input id="token" type="text" required placeholder="paste token here" />
+      </div>
+      <div class="field">
+        <label for="password">New Password</label>
+        <input id="password" type="password" required minlength="8" />
+      </div>
+      <div class="field">
+        <label for="confirm">Confirm New Password</label>
+        <input id="confirm" type="password" required minlength="8" />
+      </div>
+      <div id="resetError" class="error-msg hidden"></div>
+      <div id="resetSuccess" class="success-msg hidden"></div>
+      <button type="submit" class="btn btn-primary btn-block" id="resetBtn">Update Password</button>
+    </form>
+
+    <div class="auth-links">
+      <a href="/login">← Back to Login</a>
+    </div>
+  </div>
+
+  <script>
+    document.getElementById('resetForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const err = document.getElementById('resetError');
+      const ok = document.getElementById('resetSuccess');
+      const btn = document.getElementById('resetBtn');
+      err.classList.add('hidden');
+      ok.classList.add('hidden');
+      btn.disabled = true;
+      try {
+        const res = await fetch('/reset-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: document.getElementById('username').value.trim(),
+            token: document.getElementById('token').value.trim(),
+            password: document.getElementById('password').value,
+            confirm: document.getElementById('confirm').value,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Reset failed');
+        ok.textContent = data.message + ' Redirecting…';
+        ok.classList.remove('hidden');
+        setTimeout(() => window.location.href = '/login', 1500);
+      } catch (ex) {
+        err.textContent = ex.message;
+        err.classList.remove('hidden');
+        btn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

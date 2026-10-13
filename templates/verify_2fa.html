@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LabTrace · 2FA Verification</title>
+  <link rel="stylesheet" href="/static/css/app.css" />
+</head>
+<body class="auth-page">
+  <div class="auth-bg"></div>
+  <div class="auth-card">
+    <div class="auth-logo">
+      <span class="logo-icon">◈</span>
+      <div>
+        <h1>Two-Factor Auth</h1>
+        <p class="tagline">Enter the 6-digit code from your authenticator</p>
+      </div>
+    </div>
+
+    <form id="totpForm" class="auth-form">
+      <div class="field">
+        <label for="code">Authenticator Code</label>
+        <input id="code" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="6" required placeholder="000000" autocomplete="one-time-code" />
+      </div>
+      <div id="totpError" class="error-msg hidden"></div>
+      <button type="submit" class="btn btn-primary btn-block" id="totpBtn">Verify & Continue</button>
+    </form>
+
+    <div class="auth-links">
+      <a href="/logout">Cancel · Logout</a>
+    </div>
+  </div>
+
+  <script>
+    document.getElementById('totpForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const err = document.getElementById('totpError');
+      const btn = document.getElementById('totpBtn');
+      err.classList.add('hidden');
+      btn.disabled = true;
+      try {
+        const res = await fetch('/2fa/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: document.getElementById('code').value.trim() }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Invalid code');
+        window.location.href = '/dashboard';
+      } catch (ex) {
+        err.textContent = ex.message;
+        err.classList.remove('hidden');
+        btn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

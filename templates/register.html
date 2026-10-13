@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LabTrace · Create Account</title>
+  <link rel="stylesheet" href="/static/css/app.css" />
+</head>
+<body class="auth-page">
+  <div class="auth-bg"></div>
+  <div class="auth-card">
+    <div class="auth-logo">
+      <span class="logo-icon">◈</span>
+      <div>
+        <h1>Create Account</h1>
+        <p class="tagline">Register as Security Analyst</p>
+      </div>
+    </div>
+
+    <form id="regForm" class="auth-form">
+      <div class="field">
+        <label for="username">Username</label>
+        <input id="username" type="text" required minlength="3" placeholder="min 3 chars" />
+      </div>
+      <div class="field">
+        <label for="display_name">Display Name</label>
+        <input id="display_name" type="text" placeholder="Your name" />
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input id="password" type="password" required minlength="8" placeholder="min 8 chars" />
+      </div>
+      <div class="field">
+        <label for="confirm">Confirm Password</label>
+        <input id="confirm" type="password" required minlength="8" />
+      </div>
+      <div id="regError" class="error-msg hidden"></div>
+      <div id="regSuccess" class="success-msg hidden"></div>
+      <button type="submit" class="btn btn-primary btn-block" id="regBtn">Create Account</button>
+    </form>
+
+    <div class="auth-links">
+      <a href="/login">← Back to Login</a>
+    </div>
+  </div>
+
+  <script>
+    document.getElementById('regForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const err = document.getElementById('regError');
+      const ok = document.getElementById('regSuccess');
+      const btn = document.getElementById('regBtn');
+      err.classList.add('hidden');
+      ok.classList.add('hidden');
+      btn.disabled = true;
+      try {
+        const res = await fetch('/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: document.getElementById('username').value.trim(),
+            display_name: document.getElementById('display_name').value.trim(),
+            password: document.getElementById('password').value,
+            confirm: document.getElementById('confirm').value,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Registration failed');
+        ok.textContent = data.message + ' Redirecting…';
+        ok.classList.remove('hidden');
+        setTimeout(() => window.location.href = '/login', 1500);
+      } catch (ex) {
+        err.textContent = ex.message;
+        err.classList.remove('hidden');
+        btn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

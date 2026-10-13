@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LabTrace · Live Monitor</title>
+  <link rel="stylesheet" href="/static/css/app.css" />
+</head>
+<body class="dash-body">
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo-icon">◈</span>
+      <div>
+        <strong>LabTrace</strong>
+        <span class="sub">LogLens · LIVE MONITOR</span>
+      </div>
+    </div>
+    <nav class="topnav">
+      <a href="/dashboard" class="nav-link">Dashboard</a>
+      <a href="/monitor" class="nav-link active">Live Monitor</a>
+    </nav>
+    <div class="top-status">
+      <span class="status-dot online"></span>
+      <span>LOCAL SECURE · NO CLOUD</span>
+    </div>
+    <div class="user-menu">
+      <span class="user-chip">{{ user.display_name }} <small>({{ user.role }})</small></span>
+      <a href="/logout" class="btn btn-sm btn-ghost">Logout</a>
+    </div>
+  </header>
+
+  <div id="alertBanner" class="alert-banner hidden">
+    <span class="pulse-dot"></span>
+    <span id="bannerText">New PRIORITY alerts detected</span>
+    <div class="banner-actions">
+      <a href="/dashboard" class="btn btn-sm btn-danger">Review Cases</a>
+      <button class="btn btn-sm btn-ghost" id="bannerAck">Acknowledge</button>
+    </div>
+  </div>
+
+  <main class="monitor-grid">
+    <!-- KPI row -->
+    <section class="panel kpi-panel">
+      <div class="kpi"><span class="kpi-val" id="kpiTotal">0</span><span class="kpi-lbl">Total Logs</span></div>
+      <div class="kpi"><span class="kpi-val" id="kpiEps">0</span><span class="kpi-lbl">Events / sec</span></div>
+      <div class="kpi"><span class="kpi-val" id="kpiOpen">0</span><span class="kpi-lbl">Open Cases</span></div>
+      <div class="kpi alert"><span class="kpi-val" id="kpiPriority">0</span><span class="kpi-lbl">Priority Alerts</span></div>
+    </section>
+
+    <!-- Total logs by source -->
+    <section class="panel chart-panel">
+      <h2 class="panel-title">Total Logs by Source <span class="big-count" id="totalCount">0</span></h2>
+      <div class="chart-box"><canvas id="chSources"></canvas></div>
+    </section>
+
+    <!-- Events per 5 min -->
+    <section class="panel chart-panel">
+      <h2 class="panel-title">Last Logs <span class="rules-hint">events per 5 min · last 2 h</span></h2>
+      <div class="chart-box"><canvas id="chEvents"></canvas></div>
+    </section>
+
+    <!-- Sources over time -->
+    <section class="panel chart-panel">
+      <h2 class="panel-title">Log Sources <span class="rules-hint">per 10 min · last 6 h</span></h2>
+      <div class="chart-box"><canvas id="chSourceTime"></canvas></div>
+    </section>
+
+    <!-- Server status -->
+    <section class="panel">
+      <h2 class="panel-title">Server Status <span class="active-badge">ACTIVE</span></h2>
+      <div class="gauges">
+        <div class="gauge">
+          <div class="gauge-head"><span>CPU</span><strong id="gCpu">0%</strong></div>
+          <div class="gauge-track"><div class="gauge-fill" id="gCpuFill"></div></div>
+        </div>
+        <div class="gauge">
+          <div class="gauge-head"><span>Memory</span><strong id="gMem">0%</strong></div>
+          <div class="gauge-track"><div class="gauge-fill mem" id="gMemFill"></div></div>
+        </div>
+        <div class="gauge">
+          <div class="gauge-head"><span>Disk</span><strong id="gDisk">0%</strong></div>
+          <div class="gauge-track"><div class="gauge-fill disk" id="gDiskFill"></div></div>
+        </div>
+      </div>
+      <p class="hint-text" id="serverHint">Sampling every 2 s via psutil</p>
+    </section>
+
+    <!-- Syslog donut + EPS -->
+    <section class="panel">
+      <h2 class="panel-title">Syslog <span class="rules-hint">last 24 h</span></h2>
+      <div class="syslog-flex">
+        <div class="donut-wrap">
+          <canvas id="chDonut"></canvas>
+          <div class="donut-center"><strong id="donutTotal">0</strong><span>logs / 24 h</span></div>
+        </div>
+        <div class="eps-stats">
+          <div class="eps-row"><span>EPS now</span><strong id="epsNow">0</strong></div>
+          <div class="eps-row"><span>Max EPS</span><strong id="epsMax">0</strong></div>
+          <div class="eps-row"><span>Avg EPS</span><strong id="epsAvg">0</strong></div>
+          <div class="eps-row"><span>UDP :5140 (24 h)</span><strong id="udp24">0</strong></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Collectors -->
+    <section class="panel">
+      <h2 class="panel-title">Collectors</h2>
+      <table class="collector-table">
+        <thead>
+          <tr><th>Collector</th><th>Status</th><th>Last Seen</th><th>Detail</th></tr>
+        </thead>
+        <tbody id="collectorBody">
+          <tr><td colspan="4" class="empty">collectors starting…</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- 24h timeline -->
+    <section class="panel chart-panel wide">
+      <h2 class="panel-title">Total Logs Timeline <span class="rules-hint">last 24 h</span></h2>
+      <div class="chart-box tall"><canvas id="chTotal"></canvas></div>
+    </section>
+
+    <!-- Latest alerts -->
+    <section class="panel wide">
+      <h2 class="panel-title">Latest Alerts</h2>
+      <table class="cases-table">
+        <thead>
+          <tr><th>Priority</th><th>Case</th><th>Reason</th><th>Status</th><th>Updated</th></tr>
+        </thead>
+        <tbody id="alertsBody">
+          <tr><td colspan="5" class="empty">No alerts yet — waiting for logs</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span>Explain every alert. Blame no one. Block nothing.</span>
+    <span>Auto-refresh 5 s · Detection every 30 s · Retention 30 d</span>
+  </footer>
+
+  <script src="/static/js/chart.umd.min.js"></script>
+  <script src="/static/js/monitor.js"></script>
+</body>
+</html>

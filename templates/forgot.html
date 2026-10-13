@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LabTrace · Forgot Password</title>
+  <link rel="stylesheet" href="/static/css/app.css" />
+</head>
+<body class="auth-page">
+  <div class="auth-bg"></div>
+  <div class="auth-card">
+    <div class="auth-logo">
+      <span class="logo-icon">◈</span>
+      <div>
+        <h1>Forgot Password</h1>
+        <p class="tagline">Generate a local reset token</p>
+      </div>
+    </div>
+
+    <form id="forgotForm" class="auth-form">
+      <div class="field">
+        <label for="username">Username</label>
+        <input id="username" type="text" required placeholder="your username" />
+      </div>
+      <div id="forgotError" class="error-msg hidden"></div>
+      <div id="forgotSuccess" class="success-msg hidden"></div>
+      <div id="tokenBox" class="token-box hidden"></div>
+      <button type="submit" class="btn btn-primary btn-block" id="forgotBtn">Generate Reset Token</button>
+    </form>
+
+    <div class="auth-links">
+      <a href="/reset-password">I have a token → Reset</a>
+      <span>·</span>
+      <a href="/login">← Login</a>
+    </div>
+    <p class="secure-note">Demo mode: token is shown here (no email). Valid 1 hour.</p>
+  </div>
+
+  <script>
+    document.getElementById('forgotForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const err = document.getElementById('forgotError');
+      const ok = document.getElementById('forgotSuccess');
+      const box = document.getElementById('tokenBox');
+      const btn = document.getElementById('forgotBtn');
+      err.classList.add('hidden');
+      ok.classList.add('hidden');
+      box.classList.add('hidden');
+      btn.disabled = true;
+      try {
+        const res = await fetch('/forgot-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: document.getElementById('username').value.trim() }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed');
+        ok.textContent = data.message;
+        ok.classList.remove('hidden');
+        if (data.demo_token) {
+          box.innerHTML = '<strong>Demo Token:</strong><br/><code>' + data.demo_token + '</code><br/><small>' + (data.hint || '') + '</small>';
+          box.classList.remove('hidden');
+        }
+      } catch (ex) {
+        err.textContent = ex.message;
+        err.classList.remove('hidden');
+      }
+      btn.disabled = false;
+    });
+  </script>
+</body>
+</html>

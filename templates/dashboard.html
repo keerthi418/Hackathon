@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LabTrace · Command Dashboard</title>
+  <link rel="stylesheet" href="/static/css/app.css" />
+</head>
+<body class="dash-body">
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo-icon">◈</span>
+      <div>
+        <strong>LabTrace</strong>
+        <span class="sub">LogLens · CYBERHACK</span>
+      </div>
+    </div>
+    <nav class="topnav">
+      <a href="/dashboard" class="nav-link active">Dashboard</a>
+      <a href="/monitor" class="nav-link">Live Monitor</a>
+    </nav>
+    <div class="top-status">
+      <span class="status-dot online"></span>
+      <span>LOCAL SECURE · NO CLOUD</span>
+    </div>
+    <div class="user-menu">
+      <span class="user-chip">{{ user.display_name }} <small>({{ user.role }})</small></span>
+      {% if not user.totp_enabled %}
+      <a href="/2fa/setup" class="btn btn-sm btn-outline">Enable 2FA</a>
+      {% else %}
+      <span class="badge-2fa">2FA ON</span>
+      {% endif %}
+      <a href="/logout" class="btn btn-sm btn-ghost">Logout</a>
+    </div>
+  </header>
+
+  <div id="alertBanner" class="alert-banner hidden">
+    <span class="pulse-dot"></span>
+    <span id="bannerText">New PRIORITY alerts detected</span>
+    <div class="banner-actions">
+      <a href="/monitor" class="btn btn-sm btn-danger">Open Live Monitor</a>
+      <button class="btn btn-sm btn-ghost" id="bannerAck">Acknowledge</button>
+    </div>
+  </div>
+
+  <main class="dash-grid">
+    <!-- Left column: controls + metrics -->
+    <aside class="panel controls-panel">
+      <h2 class="panel-title">Detection Controls</h2>
+      <div class="control-row">
+        <label>N (failures)</label>
+        <input type="number" id="nThreshold" min="1" max="20" value="3" />
+      </div>
+      <div class="control-row">
+        <label>W (minutes)</label>
+        <input type="number" id="wMinutes" min="1" max="60" value="5" />
+      </div>
+      <div class="control-row">
+        <label>Lab Open</label>
+        <input type="time" id="openTime" value="08:30" />
+      </div>
+      <div class="control-row">
+        <label>Lab Close</label>
+        <input type="time" id="closeTime" value="17:30" />
+      </div>
+      <button id="btnReplay" class="btn btn-accent btn-block">▶ Replay Detection</button>
+      <hr class="sep" />
+      <button id="btnDemo" class="btn btn-primary btn-block">Load Demo CSV</button>
+      <label class="upload-btn btn btn-outline btn-block">
+        Upload CSV
+        <input type="file" id="csvFile" accept=".csv" hidden />
+      </label>
+      <p class="hint-text">Department is display-only. Never used in detection rules.</p>
+    </aside>
+
+    <!-- Center: metrics + table -->
+    <section class="panel main-panel">
+      <div class="metrics" id="metrics">
+        <div class="metric"><span class="m-val" id="mEvents">0</span><span class="m-lbl">Events</span></div>
+        <div class="metric"><span class="m-val" id="mCases">0</span><span class="m-lbl">Cases</span></div>
+        <div class="metric alert"><span class="m-val" id="mReview">0</span><span class="m-lbl">To Review</span></div>
+        <div class="metric"><span class="m-val" id="mRoutine">0</span><span class="m-lbl">Routine</span></div>
+      </div>
+
+      <h2 class="panel-title">Incident Cases <span class="rules-hint">R1: Failure Burst → Success · R2: After-Hours Success</span></h2>
+      <div class="table-wrap">
+        <table class="cases-table" id="casesTable">
+          <thead>
+            <tr>
+              <th>Priority</th>
+              <th>Account</th>
+              <th>Computer</th>
+              <th>Dept</th>
+              <th>R1</th>
+              <th>R2</th>
+              <th>Events</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="casesBody">
+            <tr><td colspan="8" class="empty">Load Demo or Upload CSV to begin analysis</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Right: evidence -->
+    <aside class="panel evidence-panel" id="evidencePanel">
+      <h2 class="panel-title">Evidence Panel</h2>
+      <div id="evidenceEmpty" class="empty-state">Select a case to view timeline, matched rules & human-check question.</div>
+      <div id="evidenceContent" class="hidden">
+        <div class="ev-header">
+          <span id="evPriority" class="prio-badge"></span>
+          <strong id="evKey"></strong>
+        </div>
+        <p class="ev-reason" id="evReason"></p>
+        <div class="ev-rules">
+          <span id="evR1" class="rule-chip">R1</span>
+          <span id="evR2" class="rule-chip">R2</span>
+        </div>
+        <div class="ev-human" id="evHuman"></div>
+        <h3>Timeline</h3>
+        <ul class="timeline" id="evTimeline"></ul>
+        <div class="ev-actions" id="evActions">
+          <button class="btn btn-success" id="btnConfirm">Confirm</button>
+          <button class="btn btn-danger" id="btnDismiss">Dismiss</button>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <footer class="foot">
+    <span>Explain every alert. Blame no one. Block nothing.</span>
+    <span id="auditLink"><a href="#" id="showAudit">System Audit Log</a></span>
+  </footer>
+
+  <div id="auditModal" class="modal hidden">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h3>System Audit Log</h3>
+        <button class="btn btn-sm btn-ghost" id="closeAudit">✕</button>
+      </div>
+      <div class="audit-list" id="auditList"></div>
+    </div>
+  </div>
+
+  <script>
+    window.__USER__ = {{ user | tojson }};
+  </script>
+  <script src="/static/js/dashboard.js"></script>
+</body>
+</html>

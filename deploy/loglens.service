@@ -1,0 +1,16 @@
+[Unit]
+Description=LabTrace LogLens - local SIEM log monitor
+After=network.target
+
+[Service]
+Type=simple
+# TODO: adjust the path to your project directory
+WorkingDirectory=/home/USER/LabTrace_LogLens
+ExecStart=/home/USER/LabTrace_LogLens/venv/bin/python /home/USER/LabTrace_LogLens/run.py
+Restart=on-failure
+RestartSec=10
+Environment=LOGLENS_HOST=127.0.0.1
+Environment=LOGLENS_PORT=5000
+
+[Install]
+WantedBy=default.target

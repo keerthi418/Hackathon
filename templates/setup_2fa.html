@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LabTrace · Setup 2FA</title>
+  <link rel="stylesheet" href="/static/css/app.css" />
+</head>
+<body class="auth-page">
+  <div class="auth-bg"></div>
+  <div class="auth-card wide">
+    <div class="auth-logo">
+      <span class="logo-icon">◈</span>
+      <div>
+        <h1>Setup Two-Factor Authentication</h1>
+        <p class="tagline">Scan with Google Authenticator / Authy / Microsoft Authenticator</p>
+      </div>
+    </div>
+
+    {% if enabled %}
+    <div class="success-msg">2FA is already enabled on this account.</div>
+    <div class="auth-links"><a href="/dashboard">← Back to Dashboard</a></div>
+    {% else %}
+    <div class="qr-section">
+      <img src="data:image/png;base64,{{ qr_b64 }}" alt="QR Code" class="qr-img" />
+      <div>
+        <p><strong>Manual secret:</strong></p>
+        <code class="secret-code">{{ secret }}</code>
+        <p class="hint">Enter this secret in your authenticator app if you cannot scan the QR.</p>
+      </div>
+    </div>
+
+    <form id="enableForm" class="auth-form">
+      <div class="field">
+        <label for="code">Enter current 6-digit code to enable</label>
+        <input id="code" type="text" inputmode="numeric" maxlength="6" required placeholder="000000" />
+      </div>
+      <div id="enableError" class="error-msg hidden"></div>
+      <div id="enableSuccess" class="success-msg hidden"></div>
+      <button type="submit" class="btn btn-primary btn-block" id="enableBtn">Enable 2FA</button>
+    </form>
+    {% endif %}
+
+    <div class="auth-links">
+      <a href="/dashboard">← Dashboard</a>
+    </div>
+  </div>
+
+  <script>
+    const form = document.getElementById('enableForm');
+    if (form) {
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const err = document.getElementById('enableError');
+        const ok = document.getElementById('enableSuccess');
+        const btn = document.getElementById('enableBtn');
+        err.classList.add('hidden');
+        ok.classList.add('hidden');
+        btn.disabled = true;
+        try {
+          const res = await fetch('/2fa/setup', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ code: document.getElementById('code').value.trim() }),
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || 'Failed');
+          ok.textContent = data.message;
+          ok.classList.remove('hidden');
+          setTimeout(() => window.location.href = '/dashboard', 1200);
+        } catch (ex) {
+          err.textContent = ex.message;
+          err.classList.remove('hidden');
+          btn.disabled = false;
+        }
+      });
+    }
+  </script>
+</body>
+</html>
