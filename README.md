@@ -19,7 +19,7 @@ Everything runs **locally on your laptop**. No cloud. No external services.
 | **Forgot Password** | Local reset-token flow (demo mode shows token) |
 | **2FA (TOTP)** | Google Authenticator / Authy compatible |
 | **Live Log Collection** | Windows Security log (4624/4625), Unix auth.log / journalctl, watched folder `data/incoming/`, UDP syslog on port 5140 |
-| **Auto Detection** | Every 30 s: R1 Failure-Burst → Success · R2 After-Hours (APScheduler) |
+| **Auto Detection** | Every 30 s: R1 Failure-Burst→Success · R2 After-Hours · R3 Burst-No-Success · R4 Cross-PC · R5 Account-Switch · R6 Repeated-Risk (APScheduler) |
 | **Live Monitor** | `/monitor` dark SOC dashboard, auto-refresh 5 s, Chart.js bundled locally (offline) |
 | **Server Status** | CPU / memory / disk of this laptop (psutil), ACTIVE badge |
 | **Live Alert Banner** | New PRIORITY cases banner on the dashboard |
@@ -116,6 +116,64 @@ s.sendto(b"<132>Mar 10 09:00:00 lab-pc sshd[1]: Failed password for invalid user
 
 ---
 
+## Automated test suite
+
+The project ships with a `unittest` suite (standard library only —
+no new dependencies) covering all six rules and the existing
+functionality:
+
+```bat
+:: run every test (from the project folder, venv activated)
+python -m unittest discover -s tests -t .
+
+:: verbose
+python -m unittest discover -s tests -t . -v
+
+:: engine rules only
+python -m unittest tests.test_engine -v
+
+:: app / API / scheduler only
+python -m unittest tests.test_app -v
+```
+
+Scenarios covered:
+
+- **R1** qualifying failures followed by success (and below-threshold /
+  spread-out negative cases)
+- **R2** successful login outside configured lab hours (incl. boundary)
+- **R3** qualifying failures without a subsequent success, plus
+  no-duplicate-alerts for overlapping windows
+- **R4** failed attempts for one account across multiple computers
+- **R5** rapid successful logins by multiple accounts on one computer
+  (configurable threshold)
+- **R6** repeated R1/R2 incidents within 24 h, including the
+  duplicate-scheduler-run and outside-24 h negative cases
+- normal logins trigger no unsupported alerts
+- missing fields and malformed timestamps never crash detection
+- repeated scheduler runs do **not** duplicate the same case
+- existing R1/R2 results remain compatible
+- authentication, dashboard, CSV import, case review (confirm /
+  dismiss / escalate), audit log and all monitor APIs still work
+
+Tests run against a **temporary** SQLite database, so the real
+`data/labtrace.db` is never touched.
+
+## Two-minute demo script
+
+Prereqs: `venv\Scripts\activate` (or `source venv/bin/activate`),
+then `python run.py`. Open **http://127.0.0.1:5000** and log in as
+`admin / LabTrace@2025`.
+
+| Time | Step | What you show |
+|------|------|---------------|
+| 0:00 | Open **Dashboard** | Compact top row: Open Cases, High Priority, Pending Reviews, Recent Events. Empty state before data loads. |
+| 0:20 | Click **Load Demo CSV** | 30 sample events load. `x.user @ PC-01` appears as **PRIORITY** (R1+R2: 4 failures → success at 02:18, after hours). `guest_lab @ PC-PRG-07` is **REVIEW** (R1). |
+| 0:40 | Click the **R1** filter chip | Only R1 cases remain; the table, severity badge, rule tag and score are visible. Click **All** to clear. |
+| 1:00 | Click the `x.user @ PC-01` row | **Evidence Panel** opens: R1 and R2 explanation cards, each with severity, the event-derived explanation, threshold (N=3 / outside 08:30–17:30), window (W=5 min), matched event IDs `#22–#26`, and the recommended next step. Expand **Event history** and **Technical metadata** (collapsible). |
+| 1:30 | Click **Confirm**, then **Dismiss** | Case status updates; the action is written to the **System Audit Log** (footer link). |
+| 1:50 | Click **Escalate** on a REVIEW case | Case jumps to PRIORITY (High) and reopens — human-in-the-loop, nothing is blocked. |
+| 2:00 | (optional) Open a second terminal and run `python tools\generate_test_logs.py --mode attack --interval 2` | Live collectors ingest the burst; within ~30 s the scheduler raises an R1/R2 alert and the red **alert banner** appears. |
+
 ## Log Collection Details
 
 | Source | How | Notes |
@@ -147,6 +205,55 @@ CREATE TABLE raw_logs (
 -- indexes on raw_logs(timestamp, source) and raw_logs(line_hash)
 ```
 
+**`cases` table** (extended, backward-compatible). Existing columns
+(`case_key`, `account`, `computer`, `department`, `priority`, `r1`,
+`r2`, `reason`, `human_check`, `event_count`, `matched_event_ids`,
+`r1_detail`, `r2_detail`, `status`, `created_at`, `updated_at`,
+`origin`, `is_new`) are unchanged. The following columns are **added**
+via a safe `ALTER TABLE … ADD COLUMN` migration that works on existing
+databases and never deletes data:
+
+| Column | Type | Purpose |
+|--------|------|---------|
+| `r3`, `r4`, `r5`, `r6` | INTEGER | Rule fired (0/1) |
+| `r3_detail` … `r6_detail` | TEXT (JSON) | Structured evidence per rule (counts, windows, timestamps, event IDs) |
+| `rules` | TEXT | Comma-joined triggered rule IDs, e.g. `R1,R2` |
+| `rule_details` | TEXT (JSON) | Full human-readable per-rule view (name, severity, explanation, recommendation, threshold, window, matched event IDs) |
+| `severity` | TEXT | High / Medium / Low (derived from priority) |
+| `score` | INTEGER | Rule-based prioritization score (0–100) |
+
+**`rule_matches` table** (new) — stores one row per distinct rule
+occurrence, deduplicated by a UNIQUE `fingerprint`. This is the
+history R6 uses to detect recurrence without counting duplicate
+scheduler runs:
+
+```sql
+CREATE TABLE rule_matches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_set TEXT,            -- e.g. 'R1' or 'R1,R2'
+    account TEXT,
+    computer TEXT,
+    first_ts TEXT, last_ts TEXT,
+    fingerprint TEXT UNIQUE,  -- sha256(account|computer|event ids)
+    matched_event_ids TEXT,   -- JSON
+    detail TEXT,              -- JSON (rule_details)
+    case_key TEXT,
+    origin TEXT DEFAULT 'live',
+    created_at TEXT
+);
+```
+
+**`settings` table** gains `r4_window` (10), `r5_threshold` (4),
+`r5_window` (10), `r6_threshold` (2), `r6_hours` (24) — all with
+defaults, added by the same safe migration.
+
+**Migration behaviour.** `init_db()` runs on startup and is
+idempotent: it only *adds* missing columns/tables and never
+modifies or deletes existing users, logs, cases or audit records.
+Cases written by an older engine (rule flags set but the new
+`rules`/`rule_details` columns empty) are automatically refreshed
+on the next detection pass so every alert is explainable.
+
 ### CSV format for the watched folder
 
 ```csv
@@ -163,24 +270,76 @@ lines, or stored as generic info records.
 
 ## Detection Rules
 
-1. **R1 – Failure Burst → Success**
-   ≥ N failed logins within W minutes, followed by a successful login.
+All six rules run **locally** on every detection pass (every 30 s,
+or on **Replay Detection**). Each rule is a small, deterministic,
+independently testable function in `app/engine.py`. Detection never
+blocks a user, terminates a session or isolates a host — it only
+produces *explainable* cases for a human to review.
 
-2. **R2 – After-Hours Success**
-   Successful login outside configured lab open–close hours.
+| Rule | Name | Default threshold | Fires when |
+|------|------|-------------------|------------|
+| **R1** | Failure Burst → Success | N=3 failures, W=5 min | ≥ N failures for one account+PC within W min, **followed by** a successful login |
+| **R2** | After-Hours Success | lab hours 08:30–17:30 | A successful login outside the configured lab open/close times |
+| **R3** | Failure Burst Without Success | N=3, W=5 min | ≥ N failures for one account+PC within W min with **no** successful login inside that window |
+| **R4** | Cross-PC Failure Pattern | 10 min window | Failed logins for **one account** across **≥ 2 distinct lab PCs** within the window |
+| **R5** | Rapid Account Switching | 4 accounts, 10 min | **≥ 4 distinct accounts** with successful logins on the **same PC** within the window |
+| **R6** | Repeated Risk Pattern | 2 recurrences, 24 h | ≥ 2 distinct R1/R2 occurrences for the same account+PC within a rolling 24 h |
 
-**Priority mapping**
-- **PRIORITY** = both R1 and R2 matched
-- **REVIEW**   = only one rule matched
-- **ROUTINE**  = neither (reason always shown)
+R4–R6 thresholds are configurable in **Detection Controls → R4–R6
+thresholds** (dashboard) or via `PUT /api/settings`
+(`r4_window`, `r5_threshold`, `r5_window`, `r6_threshold`,
+`r6_hours`).
 
-Every 30 s the scheduler pulls new `raw_logs` rows, merges them with the
-manually uploaded events and runs `detect_cases()` with your N, W and
-lab-hours settings. Cases are upserted by `case_key`; **confirmed /
-dismissed cases keep their human decision**. New or escalated PRIORITY /
-REVIEW cases raise the live alert banner (acknowledge with one click).
+**Priority mapping** (case-level triage):
+- **PRIORITY** = R1+R2 together, **or** R6 (a risk pattern recurred)
+- **REVIEW**   = exactly one of R1 / R2 / R3 / R4 / R5
+- **ROUTINE**  = no rule matched (reason always shown)
 
-Department column is **display-only** and is never used in detection.
+**Severity** is derived from priority: PRIORITY→High,
+REVIEW→Medium, ROUTINE→Low. R5 is deliberately labelled
+**Low** severity and carries an explicit false-positive warning
+because shared labs naturally have many users.
+
+**Rule-based prioritization score** (transparent, *not* a
+probability of compromise):
+
+```
+score = min(100, sum of the weights of the triggered rules)
+R1=40  R2=30  R3=25  R4=35  R5=15  R6=50
+```
+
+The score only helps order the review queue. It is computed from
+rule matches, never from any ML/AI model, and is **not** a
+likelihood of compromise.
+
+**Deduplication.** Every rule occurrence is fingerprinted
+(SHA-256 over account + computer + sorted matched event IDs) and
+stored in `rule_matches`. A repeated scheduler run over unchanged
+data produces the same fingerprint and is therefore **not**
+counted as a new incident — this is what makes R6 ignore duplicate
+scheduler runs. Clustering is greedy and non-overlapping, so
+overlapping time windows never create duplicate R3/R4/R5 alerts.
+
+Every 30 s the scheduler pulls new `raw_logs` rows, merges them
+with the manually uploaded events and runs `detect_cases()` with
+your N, W, lab-hours and R4–R6 settings. Cases are upserted by
+`case_key`; **confirmed / dismissed cases keep their human
+decision**. New or escalated PRIORITY / REVIEW cases raise the
+live alert banner (acknowledge with one click).
+
+Department column is **display-only** and is never used in
+detection. A shared public IP address is **never** treated as
+proof of a shared attacker — R4 groups strictly by
+(account, computer, timestamp).
+
+### Explainability
+
+Every alert shows, per rule: rule ID + human-readable name,
+severity, a transparent reason derived from the **actual matched
+events**, the matched evidence + event IDs, the account and
+computer, the detection threshold and time window, the recommended
+next step, and the analyst review status. A rule is only shown as
+triggered when it actually matched.
 
 ---
 
@@ -261,10 +420,10 @@ LabTrace_LogLens/
 ├── app/
 │   ├── __init__.py
 │   ├── config.py         # env-based configuration (host, ports, retention)
-│   ├── main.py           # Flask routes, auth, 2FA, monitor APIs
-│   ├── engine.py         # R1 / R2 detection engine (unchanged rules)
+│   ├── main.py           # Flask routes, auth, 2FA, dashboard + monitor APIs
+│   ├── engine.py         # R1–R6 detection engine (small, testable rules)
 │   ├── collector.py      # background log collectors (Windows/Unix/file/UDP)
-│   └── scheduler.py      # 30 s APScheduler detection job + retention
+│   └── scheduler.py      # 30 s detection job, rule_matches store, retention
 ├── data/
 │   ├── sample_lab_logs.csv
 │   ├── incoming/         # watched folder — drop .csv / .log files here
@@ -280,8 +439,13 @@ LabTrace_LogLens/
 │   ├── verify_2fa.html / setup_2fa.html
 │   ├── dashboard.html
 │   └── monitor.html
+├── tests/
+│   ├── test_engine.py   # unit tests for all six rules (R1–R6)
+│   └── test_app.py      # auth, dashboard API, CSV import, review, scheduler dedup
 ├── tools/
-│   └── generate_test_logs.py   # fake login traffic for testing
+│   ├── generate_test_logs.py   # fake login traffic for testing
+│   ├── check_migration.py      # verifies safe migration on a DB copy
+│   └── check_e2e.py            # HTTP end-to-end check (needs a running app)
 ├── deploy/
 │   └── loglens.service         # systemd user service (Linux)
 ├── start_loglens.bat           # Windows launcher
@@ -305,6 +469,36 @@ LabTrace_LogLens/
 - Everything runs **locally** — no external services
 
 ---
+
+## Limitations & known false-positive risks
+
+- **R5 is a weak signal.** Shared labs legitimately have many
+  users on one PC. It is labelled Low severity and carries an
+  explicit warning; raise `r5_threshold` (default 4) or
+  `r5_window` (default 10 min) if it is too noisy for your lab.
+- **R3 vs R1 overlap at the edge.** If a success lands just
+  after the failure window, R3 (no success *in* the window) and
+  R1 (failures *before* a success) can both describe nearby
+  events. This is intentional — they answer different questions —
+  but an analyst should read the two explanations together.
+- **R4 is not attribution.** It groups by (account, computer,
+  timestamp) only. A shared public IP or NAT gateway is never
+  treated as proof of a single attacker.
+- **R6 depends on stored history.** It counts distinct
+  R1/R2 occurrences recorded in `rule_matches`. After a database
+  wipe the history restarts, and occurrences older than the
+  retention period are pruned.
+- **Timestamps are local time** (`YYYY-MM-DD HH:MM:SS`).
+  Malformed or empty timestamps are skipped, never crash
+  detection, and are never fabricated.
+- **The audit log is a plain append-only SQLite table.** It
+  records who did what and when, but it is **not** cryptographically
+  tamper-proof — no hash chain or signature is implemented.
+- **No automatic enforcement.** The system never blocks users,
+  terminates sessions or isolates hosts; Confirm / Dismiss /
+  Escalate are human-only.
+- **Rule-based score, not a probability.** The 0–100 score is a
+  deterministic sum of rule weights for triage ordering only.
 
 ## Tech Stack
 

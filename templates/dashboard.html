@@ -63,6 +63,31 @@
         <label>Lab Close</label>
         <input type="time" id="closeTime" value="17:30" />
       </div>
+
+      <details class="advanced">
+        <summary>R4–R6 thresholds</summary>
+        <div class="control-row">
+          <label>R4 window (min)</label>
+          <input type="number" id="r4Window" min="1" max="120" value="10" />
+        </div>
+        <div class="control-row">
+          <label>R5 accounts</label>
+          <input type="number" id="r5Threshold" min="2" max="50" value="4" />
+        </div>
+        <div class="control-row">
+          <label>R5 window (min)</label>
+          <input type="number" id="r5Window" min="1" max="120" value="10" />
+        </div>
+        <div class="control-row">
+          <label>R6 recurrences</label>
+          <input type="number" id="r6Threshold" min="2" max="50" value="2" />
+        </div>
+        <div class="control-row">
+          <label>R6 window (h)</label>
+          <input type="number" id="r6Hours" min="1" max="168" value="24" />
+        </div>
+      </details>
+
       <button id="btnReplay" class="btn btn-accent btn-block">▶ Replay Detection</button>
       <hr class="sep" />
       <button id="btnDemo" class="btn btn-primary btn-block">Load Demo CSV</button>
@@ -70,19 +95,33 @@
         Upload CSV
         <input type="file" id="csvFile" accept=".csv" hidden />
       </label>
-      <p class="hint-text">Department is display-only. Never used in detection rules.</p>
+      <p class="hint-text">Department is display-only. Never used in detection. Detection is local &amp; human-in-the-loop — nothing is ever blocked automatically.</p>
     </aside>
 
     <!-- Center: metrics + table -->
     <section class="panel main-panel">
       <div class="metrics" id="metrics">
-        <div class="metric"><span class="m-val" id="mEvents">0</span><span class="m-lbl">Events</span></div>
-        <div class="metric"><span class="m-val" id="mCases">0</span><span class="m-lbl">Cases</span></div>
-        <div class="metric alert"><span class="m-val" id="mReview">0</span><span class="m-lbl">To Review</span></div>
-        <div class="metric"><span class="m-val" id="mRoutine">0</span><span class="m-lbl">Routine</span></div>
+        <div class="metric"><span class="m-val" id="mOpen">0</span><span class="m-lbl">Open Cases</span></div>
+        <div class="metric alert"><span class="m-val" id="mHigh">0</span><span class="m-lbl">High Priority</span></div>
+        <div class="metric"><span class="m-val" id="mReview">0</span><span class="m-lbl">Pending Reviews</span></div>
+        <div class="metric"><span class="m-val" id="mRecent">0</span><span class="m-lbl">Recent Events</span></div>
       </div>
 
-      <h2 class="panel-title">Incident Cases <span class="rules-hint">R1: Failure Burst → Success · R2: After-Hours Success</span></h2>
+      <h2 class="panel-title">
+        Incident Cases
+        <span class="rules-hint">R1 burst→success · R2 after-hours · R3 burst-no-success · R4 cross-PC · R5 account-switch · R6 repeat</span>
+      </h2>
+
+      <div class="rule-filter" id="ruleFilter">
+        <button class="rf-chip active" data-rule="">All</button>
+        <button class="rf-chip" data-rule="R1">R1</button>
+        <button class="rf-chip" data-rule="R2">R2</button>
+        <button class="rf-chip" data-rule="R3">R3</button>
+        <button class="rf-chip" data-rule="R4">R4</button>
+        <button class="rf-chip" data-rule="R5">R5</button>
+        <button class="rf-chip" data-rule="R6">R6</button>
+      </div>
+
       <div class="table-wrap">
         <table class="cases-table" id="casesTable">
           <thead>
@@ -90,40 +129,54 @@
               <th>Priority</th>
               <th>Account</th>
               <th>Computer</th>
-              <th>Dept</th>
-              <th>R1</th>
-              <th>R2</th>
-              <th>Events</th>
+              <th>Rule</th>
+              <th>Severity</th>
+              <th>Time</th>
               <th>Status</th>
             </tr>
           </thead>
           <tbody id="casesBody">
-            <tr><td colspan="8" class="empty">Load Demo or Upload CSV to begin analysis</td></tr>
+            <tr><td colspan="7" class="empty">Load Demo or Upload CSV to begin analysis</td></tr>
           </tbody>
         </table>
       </div>
+      <p id="tableHint" class="hint-text hidden"></p>
     </section>
 
     <!-- Right: evidence -->
     <aside class="panel evidence-panel" id="evidencePanel">
       <h2 class="panel-title">Evidence Panel</h2>
-      <div id="evidenceEmpty" class="empty-state">Select a case to view timeline, matched rules & human-check question.</div>
+      <div id="evidenceEmpty" class="empty-state">Select a case to view the rule explanation, matched evidence and recommended next step.</div>
       <div id="evidenceContent" class="hidden">
         <div class="ev-header">
           <span id="evPriority" class="prio-badge"></span>
+          <span id="evSeverity" class="sev-badge"></span>
           <strong id="evKey"></strong>
         </div>
-        <p class="ev-reason" id="evReason"></p>
-        <div class="ev-rules">
-          <span id="evR1" class="rule-chip">R1</span>
-          <span id="evR2" class="rule-chip">R2</span>
+        <div class="ev-score-row">
+          <span class="score-chip" id="evScore"></span>
+          <span class="score-note">rule-based prioritization score — not a probability of compromise</span>
         </div>
+        <p class="ev-reason" id="evReason"></p>
+        <div class="ev-rules" id="evRuleChips"></div>
         <div class="ev-human" id="evHuman"></div>
-        <h3>Timeline</h3>
-        <ul class="timeline" id="evTimeline"></ul>
+
+        <div id="evRuleCards"></div>
+
+        <details class="ev-section" id="evHistorySection">
+          <summary>Event history <span class="count-pill" id="evEventCount"></span></summary>
+          <ul class="timeline" id="evTimeline"></ul>
+        </details>
+
+        <details class="ev-section" id="evMetaSection">
+          <summary>Technical metadata</summary>
+          <dl class="meta-list" id="evMeta"></dl>
+        </details>
+
         <div class="ev-actions" id="evActions">
           <button class="btn btn-success" id="btnConfirm">Confirm</button>
           <button class="btn btn-danger" id="btnDismiss">Dismiss</button>
+          <button class="btn btn-outline" id="btnEscalate">Escalate</button>
         </div>
       </div>
     </aside>
@@ -143,6 +196,8 @@
       <div class="audit-list" id="auditList"></div>
     </div>
   </div>
+
+  <div id="toast" class="toast hidden"></div>
 
   <script>
     window.__USER__ = {{ user | tojson }};

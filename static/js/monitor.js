@@ -3,7 +3,9 @@
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => document.querySelectorAll(sel);
 
-  const REFRESH_MS = 5000;
+  // 2–5 s polling keeps the wave responsive; each refresh waits for the
+  // previous one so requests can never overlap or pile up.
+  const REFRESH_MS = 3000;
   const PALETTE = ["#00e5ff", "#7c3aed", "#22c55e", "#f59e0b", "#ef4444",
                    "#38bdf8", "#a78bfa", "#4ade80", "#fbbf24", "#f87171"];
 
@@ -122,16 +124,54 @@
   function setBarData(id, labels, data) {
     const c = charts[id];
     if (!c) return;
+    const same =
+      c.data.labels.length === labels.length &&
+      c.data.datasets[0].data.length === data.length &&
+      c.data.labels.every((v, i) => v === labels[i]) &&
+      c.data.datasets[0].data.every((v, i) => v === data[i]);
     c.data.labels = labels;
     c.data.datasets[0].data = data;
-    c.update();
+    // Only redraw when something actually changed — otherwise the chart
+    // stays perfectly still and never flickers between refreshes.
+    if (!same) c.update();
+  }
+
+  // Reuse dataset objects where possible (smooth interpolation) and skip
+  // the redraw entirely when nothing changed.
+  function applyData(c, labels, datasets) {
+    if (!c) return;
+    const same =
+      c.data.labels.length === labels.length &&
+      c.data.datasets.length === datasets.length &&
+      c.data.labels.every((v, i) => v === labels[i]) &&
+      c.data.datasets.every(
+        (ds, i) =>
+          ds.label === datasets[i].label &&
+          ds.data.length === datasets[i].data.length &&
+          ds.data.every((v, j) => v === datasets[i].data[j]));
+    c.data.labels = labels;
+    c.data.datasets = datasets;
+    if (!same) c.update();
+  }
+
+  function sourceDatasets(d) {
+    return Object.keys(d.series).map((src, i) => ({
+      label: src,
+      data: d.series[src],
+      borderColor: PALETTE[i % PALETTE.length],
+      backgroundColor: PALETTE[i % PALETTE.length] + "22",
+      fill: false, tension: 0.35, pointRadius: 0, borderWidth: 2,
+    }));
   }
 
   // ─── Data loaders ────────────────────────────────────────────
   async function loadOverview() {
     const d = await api("/api/monitor/overview");
     $("#kpiTotal").textContent = d.totalLogs.toLocaleString();
-    $("#kpiEps").textContent = d.eventsLastMinute;
+    // Events/sec = real arrival rate measured over a documented recent
+    // window (collector ring buffer). It is 0 when nothing arrives.
+    const eps = Number(d.eventsPerSecond ?? d.eventsLastMinute ?? 0);
+    $("#kpiEps").textContent = eps;
     $("#kpiOpen").textContent = d.cases.open;
     $("#kpiPriority").textContent = d.cases.priority;
     $("#totalCount").textContent = d.totalLogs.toLocaleString();
@@ -141,9 +181,13 @@
     setBarData("chSources", labels, counts);
     const c = charts.chSources;
     if (c && labels.length) {
-      c.data.datasets[0].backgroundColor = labels.map(
-        (_, i) => PALETTE[i % PALETTE.length]);
-      c.update();
+      const key = labels.join(",");
+      if (c._colorKey !== key) {
+        c.data.datasets[0].backgroundColor = labels.map(
+          (_, i) => PALETTE[i % PALETTE.length]);
+        c._colorKey = key;
+        c.update();
+      }
     }
   }
 
@@ -156,15 +200,20 @@
     const d = await api("/api/monitor/sources-timeline");
     const c = charts.chSourceTime;
     if (!c) return;
-    c.data.labels = d.labels;
-    c.data.datasets = Object.entries(d.series).map(([src, counts], i) => ({
-      label: src,
-      data: counts,
-      borderColor: PALETTE[i % PALETTE.length],
-      backgroundColor: PALETTE[i % PALETTE.length] + "22",
-      fill: false,
-    }));
-    c.update();
+    // Reuse existing dataset objects so Chart.js interpolates smoothly
+    // instead of rebuilding the whole chart on every refresh.
+    const byLabel = new Map(c.data.datasets.map((ds) => [ds.label, ds]));
+    const datasets = sourceDatasets(d).map((ds) => {
+      const prev = byLabel.get(ds.label);
+      if (prev) {
+        prev.data = ds.data;
+        prev.borderColor = ds.borderColor;
+        prev.backgroundColor = ds.backgroundColor;
+        return prev;
+      }
+      return ds;
+    });
+    applyData(c, d.labels, datasets);
   }
 
   async function loadTotalTimeline() {
@@ -198,9 +247,12 @@
 
     const c = charts.chDonut;
     if (c) {
-      c.data.labels = d.donut.map((x) => x.label);
-      c.data.datasets[0].data = d.donut.map((x) => x.count);
-      c.update();
+      applyData(c, d.donut.map((x) => x.label), [{
+        data: d.donut.map((x) => x.count),
+        backgroundColor: PALETTE,
+        borderColor: "#121a2b",
+        borderWidth: 2,
+      }]);
     }
     const total = d.donut.reduce((a, x) => a + x.count, 0);
     $("#donutTotal").textContent = total.toLocaleString();
@@ -274,18 +326,35 @@
     }
   }
 
+  let refreshing = false;
+
   async function refreshAll() {
-    await Promise.allSettled([
-      loadOverview(),
-      loadEventsTimeline(),
-      loadSourcesTimeline(),
-      loadTotalTimeline(),
-      loadServer(),
-      loadSyslog(),
-      loadCollectors(),
-      loadAlerts(),
-      loadBanner(),
-    ]);
+    if (refreshing) return;   // never overlap refresh requests
+    refreshing = true;
+    try {
+      await Promise.allSettled([
+        loadOverview(),
+        loadEventsTimeline(),
+        loadSourcesTimeline(),
+        loadTotalTimeline(),
+        loadServer(),
+        loadSyslog(),
+        loadCollectors(),
+        loadAlerts(),
+        loadBanner(),
+      ]);
+    } finally {
+      refreshing = false;
+    }
+  }
+
+  // Self-scheduling loop: the next refresh is queued only after the
+  // current one finishes, so slow responses never pile up and the
+  // charts stay smooth.
+  function scheduleRefresh() {
+    setTimeout(() => {
+      refreshAll().finally(() => scheduleRefresh());
+    }, REFRESH_MS);
   }
 
   // ─── Wiring ──────────────────────────────────────────────────
@@ -300,5 +369,5 @@
 
   initCharts();
   refreshAll();
-  setInterval(refreshAll, REFRESH_MS);
+  scheduleRefresh();
 })();

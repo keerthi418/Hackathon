@@ -24,9 +24,16 @@ from flask import (
 from werkzeug.utils import secure_filename
 
 from app.config import BASE_DIR, DB_PATH, SAMPLE_CSV
-from app.engine import detect_cases, parse_ts
-from app.collector import MANAGER, ensure_schema
-from app.scheduler import migrate_cases_table
+from app.engine import (
+    detect_cases, parse_ts,
+    RULE_NAMES, RULE_SEVERITY, RULE_RECOMMENDATIONS,
+)
+from app.collector import MANAGER, ensure_schema, EPS_WINDOW_SECONDS
+from app.scheduler import (
+    migrate_cases_table, migrate_settings_table,
+    migrate_rule_matches, get_prior_matches, _record_match,
+    backfill_legacy_cases,
+)
 
 # ─── Config ─────────────────────────────────────────
 UPLOAD_MAX = 2 * 1024 * 1024  # 2 MB
@@ -73,7 +80,12 @@ def init_db():
             open_time TEXT DEFAULT '08:30',
             close_time TEXT DEFAULT '17:30',
             n_threshold INTEGER DEFAULT 3,
-            w_minutes INTEGER DEFAULT 5
+            w_minutes INTEGER DEFAULT 5,
+            r4_window INTEGER DEFAULT 10,
+            r5_threshold INTEGER DEFAULT 4,
+            r5_window INTEGER DEFAULT 10,
+            r6_threshold INTEGER DEFAULT 2,
+            r6_hours INTEGER DEFAULT 24
         );
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,14 +103,26 @@ def init_db():
             computer TEXT,
             department TEXT,
             priority TEXT,
+            severity TEXT,
+            score INTEGER DEFAULT 0,
             r1 INTEGER,
             r2 INTEGER,
+            r3 INTEGER DEFAULT 0,
+            r4 INTEGER DEFAULT 0,
+            r5 INTEGER DEFAULT 0,
+            r6 INTEGER DEFAULT 0,
             reason TEXT,
             human_check TEXT,
             event_count INTEGER,
             matched_event_ids TEXT,
             r1_detail TEXT,
             r2_detail TEXT,
+            r3_detail TEXT,
+            r4_detail TEXT,
+            r5_detail TEXT,
+            r6_detail TEXT,
+            rules TEXT,
+            rule_details TEXT,
             status TEXT DEFAULT 'open'
         );
         CREATE TABLE IF NOT EXISTS audit_log (
@@ -133,7 +157,12 @@ def init_db():
     """)
     # live-monitoring columns on cases (safe on existing DBs)
     migrate_cases_table()
+    migrate_settings_table()
+    migrate_rule_matches()
     ensure_schema()
+    # refresh legacy cases (old engine) so every alert is
+    # explainable; the scheduler reprocesses raw_logs next
+    backfill_legacy_cases()
     # seed settings
     if not c.execute("SELECT id FROM settings WHERE id=1").fetchone():
         c.execute("INSERT INTO settings (id) VALUES (1)")
@@ -535,13 +564,23 @@ def api_settings():
            open_time = COALESCE(?, open_time),
            close_time = COALESCE(?, close_time),
            n_threshold = COALESCE(?, n_threshold),
-           w_minutes = COALESCE(?, w_minutes)
+           w_minutes = COALESCE(?, w_minutes),
+           r4_window = COALESCE(?, r4_window),
+           r5_threshold = COALESCE(?, r5_threshold),
+           r5_window = COALESCE(?, r5_window),
+           r6_threshold = COALESCE(?, r6_threshold),
+           r6_hours = COALESCE(?, r6_hours)
            WHERE id=1""",
         (
             data.get("open_time"),
             data.get("close_time"),
             data.get("n_threshold"),
             data.get("w_minutes"),
+            data.get("r4_window"),
+            data.get("r5_threshold"),
+            data.get("r5_window"),
+            data.get("r6_threshold"),
+            data.get("r6_hours"),
         ),
     )
     conn.commit()
@@ -553,35 +592,83 @@ def api_settings():
 @app.route("/api/dashboard")
 @login_required
 def api_dashboard():
+    rule_filter = (request.args.get("rule") or "").strip().upper()
     conn = get_db()
     events = conn.execute("SELECT COUNT(*) as c FROM events").fetchone()["c"]
     cases_count = conn.execute("SELECT COUNT(*) as c FROM cases").fetchone()["c"]
+    open_cases = conn.execute(
+        "SELECT COUNT(*) as c FROM cases WHERE status='open'"
+    ).fetchone()["c"]
+    high_priority = conn.execute(
+        "SELECT COUNT(*) as c FROM cases "
+        "WHERE status='open' AND priority='PRIORITY'"
+    ).fetchone()["c"]
     to_review = conn.execute(
         "SELECT COUNT(*) as c FROM cases WHERE priority IN ('PRIORITY','REVIEW') AND status='open'"
     ).fetchone()["c"]
     routine = conn.execute(
         "SELECT COUNT(*) as c FROM cases WHERE priority='ROUTINE'"
     ).fetchone()["c"]
+    # recent events (last 60 minutes, from the live raw_logs feed)
+    recent_cutoff = (datetime.now() - timedelta(minutes=60)).strftime(TS_FMT)
+    recent_events = conn.execute(
+        "SELECT COUNT(*) as c FROM raw_logs WHERE timestamp >= ?",
+        (recent_cutoff,),
+    ).fetchone()["c"]
     new_alerts = conn.execute(
         "SELECT COUNT(*) as c FROM cases "
         "WHERE is_new=1 AND status='open' AND priority IN ('PRIORITY','REVIEW')"
     ).fetchone()["c"]
     cases = conn.execute(
-        """SELECT id, case_key, account, computer, department, priority, r1, r2,
-                  reason, human_check, event_count, status
+        """SELECT id, case_key, account, computer, department, priority,
+                  severity, score, r1, r2, r3, r4, r5, r6,
+                  reason, human_check, event_count, status,
+                  matched_event_ids, rules, rule_details,
+                  r1_detail, r2_detail, r3_detail, r4_detail,
+                  r5_detail, r6_detail, created_at, updated_at
            FROM cases
            ORDER BY CASE priority WHEN 'PRIORITY' THEN 0 WHEN 'REVIEW' THEN 1 ELSE 2 END, id"""
     ).fetchall()
     conn.close()
+
+    case_list = []
+    for c in cases:
+        d = dict(c)
+        rules = [r.strip() for r in (d.get("rules") or "").split(",") if r.strip()]
+        # fallback: derive from boolean flags for legacy rows
+        if not rules:
+            rules = [r for r, flag in (
+                ("R1", d.get("r1")), ("R2", d.get("r2")),
+                ("R3", d.get("r3")), ("R4", d.get("r4")),
+                ("R5", d.get("r5")), ("R6", d.get("r6"))) if flag]
+        d["rules"] = rules
+        # backfill severity / score for legacy rows
+        if not d.get("severity"):
+            d["severity"] = {"PRIORITY": "High",
+                             "REVIEW": "Medium"}.get(
+                                 d.get("priority"), "Low")
+        if d.get("score") is None:
+            d["score"] = 0
+        # booleans for the UI
+        for flag in ("r1", "r2", "r3", "r4", "r5", "r6"):
+            d[flag] = bool(d.get(flag))
+        # optional server-side rule filter (All when empty)
+        if rule_filter and rule_filter not in rules:
+            continue
+        case_list.append(d)
+
     return jsonify({
         "metrics": {
             "events": events,
             "cases": cases_count,
+            "openCases": open_cases,
+            "highPriority": high_priority,
             "toReview": to_review,
             "routine": routine,
+            "recentEvents": recent_events,
         },
         "newAlerts": new_alerts,
-        "cases": [dict(c) for c in cases],
+        "cases": case_list,
     })
 
 
@@ -596,20 +683,93 @@ def api_case(case_id):
     case = dict(c)
     # attach events
     matched = json.loads(case.get("matched_event_ids") or "[]")
-    events = conn.execute(
-        "SELECT event_id, timestamp, account, computer, event, department_case FROM events WHERE account=? AND computer=? ORDER BY timestamp",
-        (case["account"], case["computer"]),
-    ).fetchall()
-    case["events"] = [dict(e) for e in events]
+    # R4 spans several computers, R5 several accounts — fetch the
+    # actual matched events rather than a single account@computer.
+    if matched:
+        placeholders = ",".join("?" for _ in matched)
+        if case.get("r4"):
+            rows = conn.execute(
+                f"SELECT event_id, timestamp, account, computer, event, "
+                f"department_case FROM events "
+                f"WHERE event_id IN ({placeholders}) AND account=? "
+                f"ORDER BY timestamp",
+                (*matched, case["account"]),
+            ).fetchall()
+        elif case.get("r5"):
+            rows = conn.execute(
+                f"SELECT event_id, timestamp, account, computer, event, "
+                f"department_case FROM events "
+                f"WHERE event_id IN ({placeholders}) AND computer=? "
+                f"ORDER BY timestamp",
+                (*matched, case["computer"]),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT event_id, timestamp, account, computer, event, "
+                f"department_case FROM events "
+                f"WHERE event_id IN ({placeholders}) "
+                f"ORDER BY timestamp",
+                matched,
+            ).fetchall()
+        if not rows:
+            # fall back to the account+computer window
+            rows = conn.execute(
+                "SELECT event_id, timestamp, account, computer, event, "
+                "department_case FROM events WHERE account=? AND computer=? "
+                "ORDER BY timestamp",
+                (case["account"], case["computer"]),
+            ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT event_id, timestamp, account, computer, event, "
+                "department_case FROM events WHERE account=? AND computer=? "
+                "ORDER BY timestamp",
+            (case["account"], case["computer"]),
+        ).fetchall()
+    case["events"] = [dict(e) for e in rows]
     case["matched_event_ids"] = matched
-    try:
-        case["r1_detail"] = json.loads(case["r1_detail"] or "{}")
-    except Exception:
-        case["r1_detail"] = {}
-    try:
-        case["r2_detail"] = json.loads(case["r2_detail"] or "{}")
-    except Exception:
-        case["r2_detail"] = {}
+    for key in ("r1_detail", "r2_detail", "r3_detail",
+                "r4_detail", "r5_detail", "r6_detail",
+                "rule_details"):
+        try:
+            case[key] = json.loads(case.get(key) or "[]"
+                                   if key == "rule_details"
+                                   else case.get(key) or "{}")
+        except Exception:
+            case[key] = [] if key == "rule_details" else {}
+    # boolean flags as real booleans for the UI
+    for flag in ("r1", "r2", "r3", "r4", "r5", "r6"):
+        case[flag] = bool(case.get(flag))
+    rules = [r.strip() for r in (case.get("rules") or "").split(",")
+             if r.strip()]
+    if not rules:
+        rules = [r for r, flag in (
+            ("R1", case.get("r1")), ("R2", case.get("r2")),
+            ("R3", case.get("r3")), ("R4", case.get("r4")),
+            ("R5", case.get("r5")), ("R6", case.get("r6"))) if flag]
+    case["rules"] = rules
+    # safety net: a case written by an older engine has the
+    # rule flags but no stored rule_details — synthesise a
+    # minimal explainable view from the stored rN_detail so
+    # the Evidence Panel is never blank. The scheduler
+    # backfills the full detail on its next pass.
+    if not case["rule_details"] and rules:
+        case["rule_details"] = [
+            {
+                "id": r,
+                "name": RULE_NAMES.get(r, r),
+                "severity": RULE_SEVERITY.get(r, "Medium"),
+                "triggered": True,
+                "explanation": RULE_NAMES.get(r, r) +
+                              " — refreshing explanation…",
+                "recommendation": RULE_RECOMMENDATIONS.get(r, ""),
+                "threshold": "",
+                "window": "",
+                "matchedEventIds": case.get("matched_event_ids") or [],
+                "detail": case.get(r.lower() + "_detail") or {},
+            }
+            for r in rules
+        ]
     conn.close()
     return jsonify(case)
 
@@ -619,10 +779,23 @@ def api_case(case_id):
 def api_case_action(case_id):
     data = request.get_json() or {}
     action = (data.get("action") or "").lower()
-    if action not in ("confirm", "dismiss"):
-        return jsonify({"error": "action must be confirm or dismiss"}), 400
-    status = "confirmed" if action == "confirm" else "dismissed"
+    if action not in ("confirm", "dismiss", "escalate"):
+        return jsonify({"error": "action must be confirm, dismiss or escalate"}), 400
     conn = get_db()
+    if action == "escalate":
+        # Escalation: raise the case priority to PRIORITY and
+        # reopen it for review. Recorded in the audit log. No host
+        # is blocked and no session is terminated.
+        conn.execute(
+            "UPDATE cases SET priority='PRIORITY', severity='High', "
+            "status='open', is_new=1 WHERE id=?", (case_id,)
+        )
+        conn.commit()
+        conn.close()
+        audit(session["user_id"], "CASE_ESCALATE", f"case_id={case_id}")
+        return jsonify({"ok": True, "status": "open",
+                        "priority": "PRIORITY"})
+    status = "confirmed" if action == "confirm" else "dismissed"
     conn.execute(
         "UPDATE cases SET status=?, is_new=0 WHERE id=?", (status, case_id)
     )
@@ -656,35 +829,65 @@ def _save_and_detect(events):
     W = s["w_minutes"]
     open_t = s["open_time"]
     close_t = s["close_time"]
-    cases = detect_cases(events, N=N, W=W, open_time=open_t, close_time=close_t)
+    r4_window = s["r4_window"] if s["r4_window"] is not None else 10
+    r5_threshold = (s["r5_threshold"]
+                      if s["r5_threshold"] is not None else 4)
+    r5_window = s["r5_window"] if s["r5_window"] is not None else 10
+    r6_threshold = (s["r6_threshold"]
+                      if s["r6_threshold"] is not None else 2)
+    r6_hours = s["r6_hours"] if s["r6_hours"] is not None else 24
+    prior_matches = get_prior_matches()
+    cases = detect_cases(
+        events, N=N, W=W, open_time=open_t, close_time=close_t,
+        r4_window=r4_window, r5_threshold=r5_threshold,
+        r5_window=r5_window, r6_threshold=r6_threshold,
+        r6_hours=r6_hours, prior_matches=prior_matches,
+    )
     now = datetime.now().strftime(TS_FMT)
     for c in cases:
         # replace any existing row with the same key (manual upload wins)
         conn.execute("DELETE FROM cases WHERE case_key=?", (c["case_key"],))
         conn.execute(
             """INSERT INTO cases
-               (case_key, account, computer, department, priority, r1, r2, reason,
-                human_check, event_count, matched_event_ids, r1_detail, r2_detail,
+               (case_key, account, computer, department, priority,
+                severity, score, r1, r2, r3, r4, r5, r6,
+                reason, human_check, event_count, matched_event_ids,
+                r1_detail, r2_detail, r3_detail, r4_detail,
+                r5_detail, r6_detail, rules, rule_details,
                 status, created_at, updated_at, origin, is_new)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 c["case_key"],
                 c["account"],
                 c["computer"],
                 c["department"],
                 c["priority"],
+                c.get("severity", "Low"),
+                c.get("score", 0),
                 1 if c["r1"] else 0,
                 1 if c["r2"] else 0,
+                1 if c["r3"] else 0,
+                1 if c["r4"] else 0,
+                1 if c["r5"] else 0,
+                1 if c["r6"] else 0,
                 c["reason"],
                 c.get("human_check"),
                 c["event_count"],
                 json.dumps(c.get("matched_event_ids", [])),
                 json.dumps(c.get("r1_detail") or {}),
                 json.dumps(c.get("r2_detail") or {}),
+                json.dumps(c.get("r3_detail") or {}),
+                json.dumps(c.get("r4_detail") or {}),
+                json.dumps(c.get("r5_detail") or {}),
+                json.dumps(c.get("r6_detail") or {}),
+                ",".join(c.get("rules") or []),
+                json.dumps(c.get("rule_details") or []),
                 c.get("status", "open"),
                 now, now, "manual", 1,
             ),
         )
+        # record the occurrence so R6 works across manual replays too
+        _record_match(conn, c, "manual")
     conn.commit()
     n_events = len(events)
     n_cases = len(cases)
@@ -812,7 +1015,56 @@ def monitor():
     )
 
 
-def _raw_rows_since(cutoff_str):
+# ─── Live Monitor time helpers ───────────────────────────────
+# Every raw_logs.timestamp is stored in LOCAL time as
+# 'YYYY-MM-DD HH:MM:SS' (see app/collector.py) and compared with
+# datetime.now() (also local). All monitor endpoints therefore share the
+# same timezone and bucket grid, so the charts, labels and KPIs agree.
+MONITOR_WINDOWS = {
+    # endpoint  → (bucket_seconds, span_seconds)
+    "events":  (300, 2 * 60 * 60),   # 5-minute buckets, last 2 h
+    "sources": (600, 6 * 60 * 60),   # 10-minute buckets, last 6 h
+    "total":   (3600, 24 * 60 * 60),  # hourly buckets, last 24 h
+}
+
+
+def _bucket_grid(bucket_seconds, span_seconds, now=None):
+    """Fixed, wall-clock-aligned bucket grid for a monitor chart.
+
+    Bucket i covers [start + i*bucket, start + (i+1)*bucket). The grid is
+    aligned to round *local* wall-clock marks (e.g. :00/:05 for 5-minute
+    buckets) — computed from local time components, not epoch seconds, so
+    alignment holds even in timezones whose offset is not a whole hour.
+    It always contains exactly span/bucket buckets, so labels never drift
+    between refreshes and missing periods are returned as zero counts.
+    """
+    now = now or datetime.now()
+    n = max(1, int(span_seconds // bucket_seconds))
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_secs = now.hour * 3600 + now.minute * 60 + now.second
+    end_secs = (end_secs // bucket_seconds) * bucket_seconds
+    start_secs = end_secs - (n - 1) * bucket_seconds
+    start = midnight + timedelta(seconds=start_secs)
+    labels = [
+        (start + timedelta(seconds=i * bucket_seconds)).strftime("%H:%M")
+        for i in range(n)
+    ]
+    return start, labels, n
+
+
+def _bucket_index(ts, start_epoch, bucket_seconds, n):
+    """Bucket index for a stored timestamp, or None if outside the grid."""
+    dt = parse_ts(ts)
+    if not dt:
+        return None
+    idx = int((dt.timestamp() - start_epoch) // bucket_seconds)
+    if 0 <= idx < n:
+        return idx
+    return None
+
+
+def _raw_rows_since(cutoff_dt):
+    cutoff_str = cutoff_dt.strftime(TS_FMT)
     conn = get_db()
     rows = conn.execute(
         "SELECT timestamp, source, event FROM raw_logs WHERE timestamp >= ?",
@@ -822,23 +1074,15 @@ def _raw_rows_since(cutoff_str):
     return rows
 
 
-def _bucket_counts(rows, cutoff, bucket_seconds):
-    """Bucket timestamps into fixed-width bins starting at cutoff."""
-    now = datetime.now()
-    n = max(1, int((now - cutoff).total_seconds() // bucket_seconds) + 1)
+def _bucket_counts(rows, start, bucket_seconds, n):
+    """Count raw rows into a fixed bucket grid (zero-filled)."""
+    start_epoch = int(start.timestamp())
     counts = [0] * n
-    labels = [
-        (cutoff + timedelta(seconds=i * bucket_seconds)).strftime("%H:%M")
-        for i in range(n)
-    ]
     for r in rows:
-        dt = parse_ts(r["timestamp"])
-        if not dt or dt < cutoff:
-            continue
-        idx = int((dt - cutoff).total_seconds() // bucket_seconds)
-        if 0 <= idx < n:
+        idx = _bucket_index(r["timestamp"], start_epoch, bucket_seconds, n)
+        if idx is not None:
             counts[idx] += 1
-    return labels, counts
+    return counts
 
 
 @app.route("/api/monitor/overview")
@@ -864,9 +1108,14 @@ def api_monitor_overview():
         "SELECT COUNT(*) c FROM cases WHERE status='open' AND priority='REVIEW'"
     ).fetchone()["c"]
     conn.close()
+    # Events/sec = real arrival rate measured over a documented window
+    # (collector ring buffer). It falls back to 0 when nothing arrives.
+    eps = MANAGER.eps_stats()["eps"]
     return jsonify({
         "totalLogs": total,
         "eventsLastMinute": last_min,
+        "eventsPerSecond": eps,
+        "epsWindowSeconds": EPS_WINDOW_SECONDS,
         "sources": [{"source": r["source"], "count": r["c"]} for r in sources],
         "cases": {"open": open_cases, "priority": priority_open,
                   "review": review_open},
@@ -876,44 +1125,55 @@ def api_monitor_overview():
 @app.route("/api/monitor/events-timeline")
 @login_required
 def api_monitor_events_timeline():
-    """Events per 5 minutes (last 2 hours)."""
-    cutoff = datetime.now() - timedelta(hours=2)
-    rows = _raw_rows_since(cutoff.strftime(TS_FMT))
-    labels, counts = _bucket_counts(rows, cutoff, 300)
-    return jsonify({"labels": labels, "counts": counts})
+    """Events per 5 minutes (last 2 h), wall-clock aligned, zero-filled."""
+    bucket, span = MONITOR_WINDOWS["events"]
+    start, labels, n = _bucket_grid(bucket, span)
+    rows = _raw_rows_since(start)
+    counts = _bucket_counts(rows, start, bucket, n)
+    return jsonify({
+        "labels": labels, "counts": counts,
+        "bucketSeconds": bucket, "spanSeconds": span,
+    })
 
 
 @app.route("/api/monitor/sources-timeline")
 @login_required
 def api_monitor_sources_timeline():
-    """Logs per source over time (10-minute buckets, last 6 hours)."""
-    cutoff = datetime.now() - timedelta(hours=6)
-    rows = _raw_rows_since(cutoff.strftime(TS_FMT))
-    now = datetime.now()
-    n = max(1, int((now - cutoff).total_seconds() // 600) + 1)
-    labels = [
-        (cutoff + timedelta(seconds=i * 600)).strftime("%H:%M") for i in range(n)
-    ]
+    """Logs per source over time (10-minute buckets, last 6 h)."""
+    bucket, span = MONITOR_WINDOWS["sources"]
+    start, labels, n = _bucket_grid(bucket, span)
+    start_epoch = int(start.timestamp())
+    rows = _raw_rows_since(start)
     series = {}
     for r in rows:
-        dt = parse_ts(r["timestamp"])
-        if not dt or dt < cutoff:
+        idx = _bucket_index(r["timestamp"], start_epoch, bucket, n)
+        if idx is None:
             continue
-        idx = int((dt - cutoff).total_seconds() // 600)
-        if 0 <= idx < n:
-            series.setdefault(r["source"], [0] * n)
-            series[r["source"]][idx] += 1
-    return jsonify({"labels": labels, "series": series})
+        src = r["source"]
+        if src not in series:
+            series[src] = [0] * n
+        series[src][idx] += 1
+    # stable ordering: busiest source first, then name
+    ordered = dict(sorted(series.items(),
+                          key=lambda kv: (-sum(kv[1]), kv[0])))
+    return jsonify({
+        "labels": labels, "series": ordered,
+        "bucketSeconds": bucket, "spanSeconds": span,
+    })
 
 
 @app.route("/api/monitor/total-timeline")
 @login_required
 def api_monitor_total_timeline():
-    """Total logs timeline — hourly buckets over the last 24 hours."""
-    cutoff = datetime.now() - timedelta(hours=24)
-    rows = _raw_rows_since(cutoff.strftime(TS_FMT))
-    labels, counts = _bucket_counts(rows, cutoff, 3600)
-    return jsonify({"labels": labels, "counts": counts})
+    """Total logs timeline — hourly buckets over the last 24 h."""
+    bucket, span = MONITOR_WINDOWS["total"]
+    start, labels, n = _bucket_grid(bucket, span)
+    rows = _raw_rows_since(start)
+    counts = _bucket_counts(rows, start, bucket, n)
+    return jsonify({
+        "labels": labels, "counts": counts,
+        "bucketSeconds": bucket, "spanSeconds": span,
+    })
 
 
 @app.route("/api/monitor/collectors")

@@ -38,7 +38,7 @@ def main():
     print("")
     print("  Collectors: Windows/Auth-log · File Watch (data/incoming) · "
           "Syslog UDP:5140")
-    print("  Detection : every 30s (R1 failure burst, R2 after-hours)")
+    print("  Detection : every 30s (R1–R6 explainable rules)")
     print("")
 
     start_collector()

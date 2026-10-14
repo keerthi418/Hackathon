@@ -355,7 +355,11 @@ def ingest(source, timestamp, host="", account="", computer="",
         conn.commit()
         inserted = cur.rowcount > 0
         conn.close()
-        MANAGER.record_ingest()
+        # Only count *new* records as arrivals. INSERT OR IGNORE returns
+        # rowcount 0 for a deduplicated row — feeding those to the rate
+        # ring buffer would inflate Events/sec with artificial spikes.
+        if inserted:
+            MANAGER.record_ingest()
         return inserted
     except sqlite3.OperationalError:
         ensure_schema()
@@ -370,6 +374,9 @@ SEVERITIES = {
     0: "Emergency", 1: "Alert", 2: "Critical", 3: "Error",
     4: "Warning", 5: "Notice", 6: "Informational", 7: "Debug",
 }
+
+# Documented sliding window used for the live "Events / sec" metric.
+EPS_WINDOW_SECONDS = 10
 
 
 class Stats:
@@ -401,11 +408,11 @@ class Stats:
         return counts
 
     def eps(self):
-        """Current events-per-second (10 s sliding window)."""
+        """Current events-per-second (EPS_WINDOW_SECONDS sliding window)."""
         with self._lock:
-            cutoff = time.time() - 10
+            cutoff = time.time() - EPS_WINDOW_SECONDS
             recent = sum(1 for t in self._arrivals if t >= cutoff)
-        return round(recent / 10.0, 2)
+        return round(recent / float(EPS_WINDOW_SECONDS), 2)
 
     def max_eps(self):
         buckets = self._bucket_counts(300, 1)
@@ -513,8 +520,11 @@ class WindowsEventCollector(BaseCollector):
             events = self._read_wevtutil()
             source_mode = "wevtutil"
         if events is None:
+            # Both read paths failed. Keep the collector 'degraded' (never
+            # 'active') and report the *true* reason instead of a generic
+            # message, so a broken collector is never shown as healthy.
             self.status = "degraded"
-            self.detail = "pywin32 unavailable and wevtutil query failed"
+            self.detail = self._failure_detail()
             return
 
         newest = last_ts
@@ -549,7 +559,8 @@ class WindowsEventCollector(BaseCollector):
     def _read_pywin32(self, last_ts):
         try:
             import win32evtlog  # noqa: F401
-        except ImportError:
+        except ImportError as ex:
+            self._pywin_err = f"pywin32 not installed ({ex})"
             return None
         try:
             import win32evtlog
@@ -564,7 +575,12 @@ class WindowsEventCollector(BaseCollector):
             win32evtlog.CloseEventLog(hand)
         except pywintypes.error as ex:
             # Access denied etc. → caller falls back to wevtutil
-            self.error = f"pywin32: {ex}"
+            self._pywin_err = f"pywin32: {ex}"
+            self.error = self._pywin_err
+            return None
+        except Exception as ex:  # noqa: BLE001 — try wevtutil next
+            self._pywin_err = f"pywin32: {type(ex).__name__}: {ex}"
+            self.error = self._pywin_err
             return None
 
         out = []
@@ -626,11 +642,15 @@ class WindowsEventCollector(BaseCollector):
                 capture_output=True, text=True, timeout=60,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-        except Exception as ex:
-            self.error = f"wevtutil: {ex}"
+        except FileNotFoundError as ex:
+            self._wevt_err = f"wevtutil not found ({ex})"
+            return None
+        except Exception as ex:  # noqa: BLE001 — report and stay degraded
+            self._wevt_err = f"wevtutil: {type(ex).__name__}: {ex}"
             return None
         if proc.returncode != 0:
-            self.error = f"wevtutil rc={proc.returncode}: {proc.stderr[:200]}"
+            err = (proc.stderr or proc.stdout or "").strip()[:200]
+            self._wevt_err = f"wevtutil rc={proc.returncode}: {err}"
             return None
         return self._parse_wevtutil(proc.stdout)
 
@@ -680,6 +700,23 @@ class WindowsEventCollector(BaseCollector):
                 "severity": "Informational" if eid == "4624" else "FailureAudit",
             })
         return events
+
+    def _failure_detail(self):
+        """Explain why the Security log could not be read (never hide it)."""
+        py = getattr(self, "_pywin_err", "") or "pywin32 read failed"
+        wv = getattr(self, "_wevt_err", "") or "wevtutil read failed"
+        blob = f"{py} {wv}".lower()
+        if ("access is denied" in blob or "rc=5" in blob
+                or "privilege is not held" in blob or "privilege not held" in blob):
+            return ("Security event log access denied — LabTrace must run as "
+                    "Administrator (elevated) to read event IDs 4624/4625. "
+                    f"Details: {py}; {wv}")
+        if "not installed" in py.lower() and "not found" in wv.lower():
+            return ("Windows Security log collector unavailable — pywin32 is "
+                    "not installed and wevtutil was not found. Install it "
+                    "with: pip install pywin32")
+        return (f"Windows Security log collector degraded. "
+                f"Details: {py}; {wv}")
 
 
 # ─── Unix auth log / journalctl ─────────────────────────────────
