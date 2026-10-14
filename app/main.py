@@ -1125,9 +1125,40 @@ def api_monitor_overview():
 @app.route("/api/monitor/events-timeline")
 @login_required
 def api_monitor_events_timeline():
-    """Events per 5 minutes (last 2 h), wall-clock aligned, zero-filled."""
+    """Events per 5 minutes, wall-clock aligned, zero-filled.
+
+    The window dynamically covers the actual data range: if logs exist
+    outside the default 2 h span, the grid extends to include them
+    (capped at 24 h). This ensures the chart always reflects the real
+    event distribution instead of showing all zeros.
+    """
     bucket, span = MONITOR_WINDOWS["events"]
-    start, labels, n = _bucket_grid(bucket, span)
+    conn = get_db()
+    row = conn.execute(
+        "SELECT MIN(timestamp) mn, MAX(timestamp) mx FROM raw_logs"
+    ).fetchone()
+    conn.close()
+    now = datetime.now()
+    start = now - timedelta(seconds=span)
+    end = now
+    if row and row["mn"] and row["mx"]:
+        mn = parse_ts(row["mn"])
+        mx = parse_ts(row["mx"])
+        if mn and mx:
+            if mn < start:
+                start = mn.replace(second=0, microsecond=0)
+                start -= timedelta(seconds=(start.second % bucket))
+                start -= timedelta(seconds=bucket)
+            if mx > end:
+                end = mx
+    start_epoch = int(start.timestamp())
+    end_epoch = int(end.timestamp())
+    n = max(1, (end_epoch - start_epoch) // bucket + 1)
+    n = min(n, 288)
+    labels = [
+        (start + timedelta(seconds=i * bucket)).strftime("%H:%M")
+        for i in range(n)
+    ]
     rows = _raw_rows_since(start)
     counts = _bucket_counts(rows, start, bucket, n)
     return jsonify({
