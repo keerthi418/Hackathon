@@ -23,8 +23,14 @@ DEBUG = os.environ.get("LOGLENS_DEBUG", "0") == "1"
 
 # ─── Collectors ─────────────────────────────────────────────────────
 SYSLOG_PORT = int(os.environ.get("LOGLENS_SYSLOG_PORT", "5140"))
-COLLECTOR_POLL_SECONDS = 10          # file watcher / event log poll interval
+COLLECTOR_POLL_SECONDS = 10          # file watcher poll interval
+WINDOWS_POLL_SECONDS = 4             # Windows Security log poll interval (3-5s)
 SYSLOG_THREAD_TIMEOUT = 1.0          # UDP socket recv timeout (s)
+
+# ─── Windows Event Collector ─────────────────────────────────────────
+WINDOWS_LOOKBACK_MINUTES = int(os.environ.get("LOGLENS_WINDOWS_LOOKBACK", "60"))
+WINDOWS_EVENT_IDS = (4624, 4625)    # successful / failed logon
+WINDOWS_USE_POWERSHELL = os.environ.get("LOGLENS_WINDOWS_PS", "1") == "1"
 
 # ─── Detection scheduler ────────────────────────────────────────────
 DETECT_INTERVAL_SECONDS = 30         # APScheduler cadence

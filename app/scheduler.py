@@ -172,11 +172,16 @@ def _merged_events(conn):
     NOTE: we must NOT dedup by (account, computer, timestamp, event):
     distinct events can share the same second (e.g. 5 failures in one
     second) and collapsing them would break the R1 burst detection.
+
+    Windows-specific fields (logon_type, source_ip, etc.) are preserved
+    for explainable detection.
     """
     events = []
 
     for r in conn.execute(
-        "SELECT id, timestamp, account, computer, event FROM raw_logs ORDER BY id"
+        "SELECT id, timestamp, account, computer, event, logon_type, "
+        "source_ip, source_workstation, auth_package, domain "
+        "FROM raw_logs ORDER BY id"
     ):
         events.append({
             "event_id": f"raw:{r['id']}",
@@ -185,6 +190,11 @@ def _merged_events(conn):
             "computer": r["computer"],
             "event": r["event"],
             "department_case": "",
+            "logon_type": r["logon_type"] or "",
+            "source_ip": r["source_ip"] or "",
+            "source_workstation": r["source_workstation"] or "",
+            "auth_package": r["auth_package"] or "",
+            "domain": r["domain"] or "",
         })
 
     for r in conn.execute(

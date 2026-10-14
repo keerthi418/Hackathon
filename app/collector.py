@@ -44,6 +44,10 @@ from app.config import (
     SERVER_SAMPLE_SECONDS,
     SYSLOG_PORT,
     SYSLOG_THREAD_TIMEOUT,
+    WINDOWS_POLL_SECONDS,
+    WINDOWS_LOOKBACK_MINUTES,
+    WINDOWS_EVENT_IDS,
+    WINDOWS_USE_POWERSHELL,
 )
 
 HOSTNAME = socket.gethostname()
@@ -62,6 +66,7 @@ def ensure_schema():
     os.makedirs(INCOMING_DIR, exist_ok=True)
     conn = _connect()
     try:
+        # Create table with base columns (for fresh databases)
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS raw_logs (
@@ -89,6 +94,26 @@ def ensure_schema():
             );
             """
         )
+        # Safe migration: add Windows-specific columns if missing
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(raw_logs)")}
+        migrations = {
+            "record_id": "TEXT DEFAULT ''",
+            "channel": "TEXT DEFAULT ''",
+            "logon_type": "TEXT DEFAULT ''",
+            "source_ip": "TEXT DEFAULT ''",
+            "source_workstation": "TEXT DEFAULT ''",
+            "auth_package": "TEXT DEFAULT ''",
+            "domain": "TEXT DEFAULT ''",
+        }
+        for col, ddl in migrations.items():
+            if col not in cols:
+                conn.execute(f"ALTER TABLE raw_logs ADD COLUMN {col} {ddl}")
+        # Add record index if record_id column exists
+        if "record_id" in cols:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_raw_logs_record "
+                "ON raw_logs(source, record_id)"
+            )
         conn.commit()
     finally:
         conn.close()
@@ -336,8 +361,15 @@ def line_hash(source, host, account, computer, event, message, ts):
 
 
 def ingest(source, timestamp, host="", account="", computer="",
-           event="Info", message="", severity="Informational"):
-    """Insert one normalized record. Returns True when it was new."""
+           event="Info", message="", severity="Informational",
+           record_id="", channel="", logon_type="", source_ip="",
+           source_workstation="", auth_package="", domain=""):
+    """Insert one normalized record. Returns True when it was new.
+
+    Windows-specific fields (record_id, channel, logon_type, source_ip,
+    source_workstation, auth_package, domain) are stored alongside the
+    normalized record for explainable detection and investigation.
+    """
     if not timestamp:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     host = host or HOSTNAME
@@ -347,10 +379,12 @@ def ingest(source, timestamp, host="", account="", computer="",
         cur = conn.execute(
             """INSERT OR IGNORE INTO raw_logs
                (timestamp, source, host, account, computer, event, message,
-                severity, line_hash)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+                severity, line_hash, record_id, channel, logon_type, source_ip,
+                source_workstation, auth_package, domain)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (timestamp, source, host, account, computer, event, message,
-             severity, h),
+             severity, h, record_id, channel, logon_type, source_ip,
+             source_workstation, auth_package, domain),
         )
         conn.commit()
         inserted = cur.rowcount > 0
@@ -502,35 +536,102 @@ WIN_EVENT_QUERY = (
     'and TimeCreated[timediff(@SystemTime) <= 3600000]]]'
 )
 
+# PowerShell script for rich XML event extraction from the Security channel.
+# Extracts: EventID, RecordID, TimeCreated, Account, Domain, LogonType,
+# SourceIP, SourceWorkstation, AuthenticationPackage, Computer.
+_PS_SECURITY_SCRIPT = r'''
+$ErrorActionPreference = 'SilentlyContinue'
+$lookback = {lookback}
+$ids = @({event_ids})
+$now = [DateTime]::UtcNow
+$since = $now.AddMinutes(-$lookback)
+$filter = @"
+<QueryList>
+  <Query Id="0" Path="Security">
+    <Select Path="Security">
+      *[System[(EventID=4624 or EventID=4625)
+        and TimeCreated[timediff(@SystemTime) <= {lookback_ms}]]]
+    </Select>
+  </Query>
+</QueryList>
+"@
+$events = Get-WinEvent -FilterXml $filter -MaxEvents 2000
+if (-not $events) {{ exit 0 }}
+foreach ($e in $events) {{
+    $xml = [xml]$e.ToXml()
+    $data = @{{}}
+    foreach ($d in $xml.Event.EventData.Data) {{
+        if ($d.Name) {{ $data[$d.Name] = $d.'#text' }}
+    }}
+    $eid = $xml.Event.System.EventID
+    $recId = $xml.Event.System.EventRecordID
+    $timeCreated = $xml.Event.System.TimeCreated.SystemTime
+    $computer = $xml.Event.System.Computer
+    $subjectUser = $data['SubjectUserName']
+    $targetUser = $data['TargetUserName']
+    $targetDomain = $data['TargetDomainName']
+    $logonType = $data['LogonType']
+    $ipAddr = $data['IpAddress']
+    $workstation = $data['WorkstationName']
+    $authPkg = $data['AuthenticationPackageName']
+    $channel = $xml.Event.System.Channel
+    # Output as pipe-delimited for reliable parsing
+    Write-Output ("WIN|{{0}}|{{1}}|{{2}}|{{3}}|{{4}}|{{5}}|{{6}}|{{7}}|{{8}}|{{9}}|{{10}}" -f $eid, $recId, $timeCreated, $computer, $targetUser, $targetDomain, $logonType, $ipAddr, $workstation, $authPkg, $channel)
+}}
+'''.strip()
+
 
 class WindowsEventCollector(BaseCollector):
     name = "windows"
     friendly_name = "Windows Security Event Log"
-    interval = COLLECTOR_POLL_SECONDS
+    interval = WINDOWS_POLL_SECONDS
+
+    def __init__(self, manager):
+        super().__init__(manager)
+        self._last_record_id = None
+        self._last_query_time = None
+        self._failed_deliveries = 0
+        self._last_ingested_record_id = None
 
     def poll(self):
         st = self.state()
         extra = dict(st.get("extra") or {})
         last_ts = extra.get("last_ts")
+        last_record = extra.get("last_record_id")
         new_count = 0
 
-        events = self._read_pywin32(last_ts)
-        source_mode = "pywin32"
+        # Try PowerShell path first (richer XML extraction)
+        events = None
+        source_mode = "powershell"
+        if WINDOWS_USE_POWERSHELL:
+            events = self._read_powershell(last_ts)
+            if events is not None:
+                source_mode = "powershell"
+
+        # Fallback to pywin32
+        if events is None and not WINDOWS_USE_POWERSHELL:
+            events = self._read_pywin32(last_ts)
+            source_mode = "pywin32"
+
+        # Fallback to wevtutil
         if events is None:
             events = self._read_wevtutil()
             source_mode = "wevtutil"
+
         if events is None:
-            # Both read paths failed. Keep the collector 'degraded' (never
-            # 'active') and report the *true* reason instead of a generic
-            # message, so a broken collector is never shown as healthy.
             self.status = "degraded"
             self.detail = self._failure_detail()
             return
 
         newest = last_ts
+        newest_record = last_record
         for ev in events:
             if last_ts and ev["timestamp"] and ev["timestamp"] <= last_ts:
-                continue
+                # Additional dedup by record ID for same-timestamp events
+                if ev.get("record_id") and ev["record_id"] == last_record:
+                    continue
+                if not ev.get("record_id") and ev["timestamp"] <= last_ts:
+                    continue
             if ingest(
                 "windows",
                 ev["timestamp"],
@@ -540,20 +641,140 @@ class WindowsEventCollector(BaseCollector):
                 event=ev["event"],
                 message=ev.get("message", ""),
                 severity=ev.get("severity", "Informational"),
+                record_id=ev.get("record_id", ""),
+                channel=ev.get("channel", "Security"),
+                logon_type=ev.get("logon_type", ""),
+                source_ip=ev.get("source_ip", ""),
+                source_workstation=ev.get("source_workstation", ""),
+                auth_package=ev.get("auth_package", ""),
+                domain=ev.get("domain", ""),
             ):
                 new_count += 1
             if ev["timestamp"] and (not newest or ev["timestamp"] > newest):
                 newest = ev["timestamp"]
+            if ev.get("record_id") and (not newest_record or
+                                          ev["record_id"] > newest_record):
+                newest_record = ev["record_id"]
 
         if newest and newest != last_ts:
             extra["last_ts"] = newest
+        if newest_record and newest_record != last_record:
+            extra["last_record_id"] = newest_record
         self.ingested += new_count
+        self._last_ingested_record_id = newest_record
         self.status = "active"
         self.detail = (
             f"source={source_mode} · 4624/4625 · +{new_count} new "
             f"(total {self.ingested})"
         )
         self.mark_seen(extra=extra)
+
+    # -- PowerShell path (preferred: rich XML extraction) ----------------
+    def _read_powershell(self, last_ts):
+        """Read Security events via PowerShell Get-WinEvent with XML parsing.
+
+        Extracts full event data including logon type, source IP,
+        workstation name, authentication package, and domain — fields
+        that pywin32's StringInserts may not reliably provide.
+        """
+        try:
+            lookback = WINDOWS_LOOKBACK_MINUTES
+            lookback_ms = lookback * 60 * 1000
+            event_ids_str = ",".join(str(e) for e in WINDOWS_EVENT_IDS)
+            script = _PS_SECURITY_SCRIPT.format(
+                lookback=lookback,
+                lookback_ms=lookback_ms,
+                event_ids=event_ids_str,
+            )
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive",
+                 "-Command", script],
+                capture_output=True, text=True, timeout=30,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except FileNotFoundError:
+            self._ps_err = "PowerShell not found"
+            return None
+        except subprocess.TimeoutExpired:
+            self._ps_err = "PowerShell query timed out (30s)"
+            return None
+        except Exception as ex:
+            self._ps_err = f"PowerShell: {type(ex).__name__}: {ex}"
+            return None
+
+        if proc.returncode != 0:
+            err = (proc.stderr or "").strip()[:300]
+            if "access is denied" in err.lower() or "privilege" in err.lower():
+                self._ps_err = f"PowerShell access denied: {err}"
+            else:
+                self._ps_err = f"PowerShell rc={proc.returncode}: {err}"
+            return None
+
+        return self._parse_powershell(proc.stdout)
+
+    @staticmethod
+    def _parse_powershell(text):
+        """Parse pipe-delimited PowerShell output into event dicts."""
+        events = []
+        for line in text.strip().splitlines():
+            line = line.strip()
+            if not line.startswith("WIN|"):
+                continue
+            parts = line.split("|")
+            if len(parts) < 11:
+                continue
+            # WIN|eid|recId|timeCreated|computer|targetUser|targetDomain|logonType|ipAddr|workstation|authPkg|channel
+            try:
+                eid = int(parts[1])
+            except (ValueError, IndexError):
+                continue
+            if eid not in (4624, 4625):
+                continue
+            ts = parse_ts_flexible(parts[3])
+            if not ts:
+                continue
+            computer = parts[4].strip() or HOSTNAME
+            target_user = parts[5].strip()
+            target_domain = parts[6].strip()
+            logon_type = parts[7].strip()
+            ip_addr = parts[8].strip()
+            workstation = parts[9].strip()
+            auth_pkg = parts[10].strip()
+            channel = parts[11].strip() if len(parts) > 11 else "Security"
+
+            # Build a descriptive message
+            event_type = "Success" if eid == 4624 else "Failure"
+            msg_parts = [f"EventID {eid}"]
+            if target_user:
+                msg_parts.append(f"Account: {target_user}")
+            if target_domain:
+                msg_parts.append(f"Domain: {target_domain}")
+            if logon_type:
+                msg_parts.append(f"LogonType: {logon_type}")
+            if ip_addr and ip_addr != "-":
+                msg_parts.append(f"SourceIP: {ip_addr}")
+            if workstation and workstation != "-":
+                msg_parts.append(f"Workstation: {workstation}")
+            if auth_pkg:
+                msg_parts.append(f"AuthPackage: {auth_pkg}")
+
+            events.append({
+                "timestamp": ts,
+                "host": computer,
+                "account": target_user,
+                "computer": computer,
+                "event": event_type,
+                "message": "; ".join(msg_parts),
+                "severity": "Informational" if eid == 4624 else "FailureAudit",
+                "record_id": parts[2].strip(),
+                "channel": channel,
+                "logon_type": logon_type,
+                "source_ip": ip_addr if ip_addr != "-" else "",
+                "source_workstation": workstation if workstation != "-" else "",
+                "auth_package": auth_pkg,
+                "domain": target_domain,
+            })
+        return events
 
     # -- pywin32 path ---------------------------------------------------
     def _read_pywin32(self, last_ts):
@@ -574,7 +795,6 @@ class WindowsEventCollector(BaseCollector):
             records = win32evtlog.ReadEventLog(hand, flags, 0)
             win32evtlog.CloseEventLog(hand)
         except pywintypes.error as ex:
-            # Access denied etc. → caller falls back to wevtutil
             self._pywin_err = f"pywin32: {ex}"
             self.error = self._pywin_err
             return None
@@ -605,6 +825,35 @@ class WindowsEventCollector(BaseCollector):
                         account = str(v).strip()
                         break
             computer = str(getattr(ev, "ComputerName", "") or "").strip() or HOSTNAME
+            # Extract logon type from StringInserts[8] for 4624/4625
+            logon_type = ""
+            if len(inserts) > 8:
+                logon_type = str(inserts[8] or "").strip()
+            # Source IP is StringInserts[18] for 4625, [19] for 4624
+            source_ip = ""
+            ip_idx = 18 if eid == 4625 else 19
+            if len(inserts) > ip_idx:
+                source_ip = str(inserts[ip_idx] or "").strip()
+                if source_ip == "-":
+                    source_ip = ""
+            # Domain is StringInserts[6] for 4625, [7] for 4624
+            domain = ""
+            dom_idx = 6 if eid == 4625 else 7
+            if len(inserts) > dom_idx:
+                domain = str(inserts[dom_idx] or "").strip()
+            # Workstation is StringInserts[11] for 4625, [12] for 4624
+            workstation = ""
+            ws_idx = 11 if eid == 4625 else 12
+            if len(inserts) > ws_idx:
+                workstation = str(inserts[ws_idx] or "").strip()
+                if workstation == "-":
+                    workstation = ""
+            # Auth package is StringInserts[10] for 4625, [11] for 4624
+            auth_pkg = ""
+            ap_idx = 10 if eid == 4625 else 11
+            if len(inserts) > ap_idx:
+                auth_pkg = str(inserts[ap_idx] or "").strip()
+
             out.append({
                 "timestamp": ts,
                 "host": computer,
@@ -615,6 +864,13 @@ class WindowsEventCollector(BaseCollector):
                     str(x) for x in inserts if x
                 ),
                 "severity": "Informational" if eid == 4624 else "FailureAudit",
+                "record_id": str(getattr(ev, "RecordNumber", "") or ""),
+                "channel": "Security",
+                "logon_type": logon_type,
+                "source_ip": source_ip,
+                "source_workstation": workstation,
+                "auth_package": auth_pkg,
+                "domain": domain,
             })
         return out
 
@@ -703,20 +959,24 @@ class WindowsEventCollector(BaseCollector):
 
     def _failure_detail(self):
         """Explain why the Security log could not be read (never hide it)."""
-        py = getattr(self, "_pywin_err", "") or "pywin32 read failed"
-        wv = getattr(self, "_wevt_err", "") or "wevtutil read failed"
-        blob = f"{py} {wv}".lower()
+        py = getattr(self, "_pywin_err", "") or ""
+        wv = getattr(self, "_wevt_err", "") or ""
+        ps = getattr(self, "_ps_err", "") or ""
+        parts = [p for p in (ps, py, wv) if p]
+        blob = " ".join(parts).lower()
         if ("access is denied" in blob or "rc=5" in blob
                 or "privilege is not held" in blob or "privilege not held" in blob):
             return ("Security event log access denied — LabTrace must run as "
                     "Administrator (elevated) to read event IDs 4624/4625. "
-                    f"Details: {py}; {wv}")
+                    f"Details: {'; '.join(parts)}")
         if "not installed" in py.lower() and "not found" in wv.lower():
             return ("Windows Security log collector unavailable — pywin32 is "
                     "not installed and wevtutil was not found. Install it "
                     "with: pip install pywin32")
+        if not parts:
+            return "Windows Security log collector degraded — unknown error"
         return (f"Windows Security log collector degraded. "
-                f"Details: {py}; {wv}")
+                f"Details: {'; '.join(parts)}")
 
 
 # ─── Unix auth log / journalctl ─────────────────────────────────

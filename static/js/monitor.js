@@ -326,6 +326,28 @@
     }
   }
 
+  async function loadMode() {
+    try {
+      const d = await api("/api/mode");
+      const indicator = $("#modeIndicator");
+      const detail = $("#modeDetail");
+      if (d.isLive) {
+        indicator.textContent = "● LIVE MODE";
+        indicator.className = "mode-indicator mode-live";
+        detail.textContent =
+          `${d.liveWindowsEvents} Windows Security events · ` +
+          `collector: ${d.collectorHealthy ? "healthy" : d.collectorStatus}`;
+      } else {
+        indicator.textContent = "○ DEMO MODE";
+        indicator.className = "mode-indicator mode-demo";
+        detail.textContent =
+          `${d.manualEvents} uploaded events · no live Windows collection`;
+      }
+    } catch (e) {
+      console.warn(e);
+    }
+  }
+
   let refreshing = false;
 
   async function refreshAll() {
@@ -342,6 +364,7 @@
         loadCollectors(),
         loadAlerts(),
         loadBanner(),
+        loadMode(),
       ]);
     } finally {
       refreshing = false;

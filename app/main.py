@@ -130,7 +130,9 @@ def init_db():
             user_id INTEGER,
             action TEXT,
             details TEXT,
-            created_at TEXT DEFAULT (datetime('now'))
+            created_at TEXT DEFAULT (datetime('now')),
+            prev_hash TEXT DEFAULT 'GENESIS',
+            entry_hash TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS raw_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -160,6 +162,12 @@ def init_db():
     migrate_settings_table()
     migrate_rule_matches()
     ensure_schema()
+    # Add hash-chain columns to audit_log if missing (safe migration)
+    audit_cols = {r["name"] for r in c.execute("PRAGMA table_info(audit_log)")}
+    if "prev_hash" not in audit_cols:
+        c.execute("ALTER TABLE audit_log ADD COLUMN prev_hash TEXT DEFAULT 'GENESIS'")
+    if "entry_hash" not in audit_cols:
+        c.execute("ALTER TABLE audit_log ADD COLUMN entry_hash TEXT DEFAULT ''")
     # refresh legacy cases (old engine) so every alert is
     # explainable; the scheduler reprocesses raw_logs next
     backfill_legacy_cases()
@@ -181,17 +189,95 @@ def init_db():
     conn.close()
 
 
+def _audit_hash(user_id, action, details, created_at):
+    """Compute SHA-256 hash chain for audit integrity verification."""
+    import hashlib
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT entry_hash FROM audit_log ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        prev_hash = row["entry_hash"] if row else "GENESIS"
+    except Exception:
+        prev_hash = "GENESIS"
+    finally:
+        conn.close()
+    payload = f"{prev_hash}|{user_id}|{action}|{details}|{created_at}"
+    return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()
+
+
 def audit(user_id, action, details=""):
+    """Record an audit log entry with hash-chain integrity verification.
+
+    Each entry includes a SHA-256 hash chaining it to the previous entry,
+    creating a tamper-evident audit trail. Passwords, session secrets,
+    and API keys are never recorded.
+    """
     try:
         conn = get_db()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry_hash = _audit_hash(user_id, action, details, now)
         conn.execute(
-            "INSERT INTO audit_log (user_id, action, details) VALUES (?,?,?)",
-            (user_id, action, details),
+            "INSERT INTO audit_log (user_id, action, details, created_at, prev_hash, entry_hash) "
+            "VALUES (?,?,?,?,?,?)",
+            (user_id, action, details, now, 
+             _audit_prev_hash(), entry_hash),
         )
         conn.commit()
         conn.close()
     except Exception:
         pass
+
+
+def _audit_prev_hash():
+    """Get the hash of the last audit entry (for chain verification)."""
+    import hashlib
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT entry_hash FROM audit_log ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return row["entry_hash"] if row else "GENESIS"
+    except Exception:
+        return "GENESIS"
+    finally:
+        conn.close()
+
+
+def verify_audit_integrity():
+    """Verify the hash-chain integrity of the audit log.
+
+    Returns (is_valid, tampered_entries) where tampered_entries is a list
+    of entry IDs where the chain breaks. An empty list means the chain
+    is intact.
+    """
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT id, user_id, action, details, created_at, prev_hash, entry_hash "
+            "FROM audit_log ORDER BY id"
+        ).fetchall()
+    except Exception as e:
+        return False, [{"error": str(e)}]
+    finally:
+        conn.close()
+
+    tampered = []
+    prev_hash = "GENESIS"
+    for row in rows:
+        payload = f"{prev_hash}|{row['user_id']}|{row['action']}|{row['details']}|{row['created_at']}"
+        import hashlib
+        expected = hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()
+        if expected != row["entry_hash"] or row["prev_hash"] != prev_hash:
+            tampered.append({
+                "id": row["id"],
+                "action": row["action"],
+                "created_at": row["created_at"],
+                "expected_hash": expected,
+                "actual_hash": row["entry_hash"],
+            })
+        prev_hash = row["entry_hash"]
+    return len(tampered) == 0, tampered
 
 
 # ─── Auth decorators ────────────────────────────────
@@ -1000,6 +1086,64 @@ def api_audit():
     return jsonify([dict(r) for r in rows])
 
 
+@app.route("/api/audit/verify")
+@login_required
+def api_audit_verify():
+    """Verify the hash-chain integrity of the audit log."""
+    is_valid, tampered = verify_audit_integrity()
+    if is_valid:
+        return jsonify({"valid": True, "message": "Audit log integrity verified"})
+    return jsonify({
+        "valid": False,
+        "message": "Audit log integrity check FAILED",
+        "tampered_entries": tampered,
+    }), 400
+
+
+@app.route("/api/mode")
+@login_required
+def api_mode():
+    """Return the current monitoring mode and event source status.
+
+    Live Mode: genuine Windows Security Log events are being collected.
+    Demo Mode: only simulated/uploaded events exist (no live collection).
+    """
+    conn = get_db()
+    # Check if any live Windows events exist
+    live_windows = conn.execute(
+        "SELECT COUNT(*) c FROM raw_logs WHERE source='windows'"
+    ).fetchone()["c"]
+    live_total = conn.execute(
+        "SELECT COUNT(*) c FROM raw_logs"
+    ).fetchone()["c"]
+    manual_total = conn.execute(
+        "SELECT COUNT(*) c FROM events"
+    ).fetchone()["c"]
+    conn.close()
+
+    # Determine mode: if we have live Windows events, we're in Live Mode
+    is_live = live_windows > 0
+    # Check collector status
+    collectors = MANAGER.status()
+    windows_collector = next(
+        (c for c in collectors if c["key"] == "windows"), None
+    )
+    collector_healthy = (
+        windows_collector and windows_collector["status"] == "active"
+    )
+
+    return jsonify({
+        "mode": "live" if is_live else "demo",
+        "isLive": is_live,
+        "liveWindowsEvents": live_windows,
+        "totalLiveEvents": live_total,
+        "manualEvents": manual_total,
+        "collectorHealthy": collector_healthy,
+        "collectorStatus": windows_collector["status"] if windows_collector else "unknown",
+        "eventSource": "windows_security_log" if is_live else "manual_upload",
+    })
+
+
 # ─── Live Monitor ─────────────────────────────────────
 @app.route("/monitor")
 @login_required
@@ -1170,21 +1314,40 @@ def api_monitor_events_timeline():
 @app.route("/api/monitor/sources-timeline")
 @login_required
 def api_monitor_sources_timeline():
-    """Logs per source over time (10-minute buckets, last 6 h)."""
+    """Logs per source over time (10-minute buckets, last 6 h or anchored to data)."""
     bucket, span = MONITOR_WINDOWS["sources"]
-    start, labels, n = _bucket_grid(bucket, span)
+    conn = get_db()
+    row = conn.execute("SELECT MIN(timestamp) mn, MAX(timestamp) mx FROM raw_logs").fetchone()
+    all_sources = [r["source"] for r in conn.execute("SELECT DISTINCT source FROM raw_logs").fetchall() if r["source"]]
+    conn.close()
+
+    now = datetime.now()
+    start = now - timedelta(seconds=span)
+    if row and row["mx"]:
+        mx = parse_ts(row["mx"])
+        if mx and (now - mx).total_seconds() > span:
+            start = mx - timedelta(seconds=span)
+
     start_epoch = int(start.timestamp())
+    n = max(1, int(span // bucket))
+    labels = [
+        (start + timedelta(seconds=i * bucket)).strftime("%H:%M")
+        for i in range(n)
+    ]
     rows = _raw_rows_since(start)
     series = {}
+    for src in all_sources:
+        series[src] = [0] * n
+
     for r in rows:
         idx = _bucket_index(r["timestamp"], start_epoch, bucket, n)
         if idx is None:
             continue
-        src = r["source"]
+        src = r["source"] or "unknown"
         if src not in series:
             series[src] = [0] * n
         series[src][idx] += 1
-    # stable ordering: busiest source first, then name
+
     ordered = dict(sorted(series.items(),
                           key=lambda kv: (-sum(kv[1]), kv[0])))
     return jsonify({
@@ -1196,9 +1359,24 @@ def api_monitor_sources_timeline():
 @app.route("/api/monitor/total-timeline")
 @login_required
 def api_monitor_total_timeline():
-    """Total logs timeline — hourly buckets over the last 24 h."""
+    """Total logs timeline — hourly buckets over the last 24 h or anchored to data."""
     bucket, span = MONITOR_WINDOWS["total"]
-    start, labels, n = _bucket_grid(bucket, span)
+    conn = get_db()
+    row = conn.execute("SELECT MIN(timestamp) mn, MAX(timestamp) mx FROM raw_logs").fetchone()
+    conn.close()
+
+    now = datetime.now()
+    start = now - timedelta(seconds=span)
+    if row and row["mx"]:
+        mx = parse_ts(row["mx"])
+        if mx and (now - mx).total_seconds() > span:
+            start = mx - timedelta(seconds=span)
+
+    n = max(1, int(span // bucket))
+    labels = [
+        (start + timedelta(seconds=i * bucket)).strftime("%H:%M")
+        for i in range(n)
+    ]
     rows = _raw_rows_since(start)
     counts = _bucket_counts(rows, start, bucket, n)
     return jsonify({

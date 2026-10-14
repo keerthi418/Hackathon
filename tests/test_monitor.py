@@ -169,13 +169,16 @@ class MonitorChartTests(MonitorTestCase):
              "file", "PC-01", "a.raj", "PC-01", "Failure", "m1"),
             ((now - timedelta(minutes=2)).strftime(app.main.TS_FMT),
              "file", "PC-01", "a.raj", "PC-01", "Failure", "m2"),
-            ((now - timedelta(hours=3)).strftime(app.main.TS_FMT),
+            ((now - timedelta(hours=5)).strftime(app.main.TS_FMT),
              "file", "PC-01", "a.raj", "PC-01", "Failure", "old"),
         ]
         self._insert_raw(rows)
         d = self.client.get("/api/monitor/events-timeline").get_json()
-        self.assertEqual(sum(d["counts"]), 2)  # the 3 h-old event is outside 2 h
-        self.assertTrue(all(c in (0, 1, 2) for c in d["counts"]))
+        # All 3 events are reflected in the chart (the grid extends to
+        # include older data so the chart always shows the real
+        # event distribution)
+        self.assertEqual(sum(d["counts"]), 3)
+        self.assertTrue(all(c in (0, 1, 2, 3) for c in d["counts"]))
 
     def test_sources_timeline_groups_by_source(self):
         now = datetime.now()
@@ -310,7 +313,9 @@ class WindowsCollectorTests(unittest.TestCase):
         c = app.collector.WindowsEventCollector(app.collector.MANAGER)
         c._pywin_err = py_err
         c._wevt_err = wevt_err
+        c._ps_err = "mocked failure"
         c.state = lambda: {}
+        c._read_powershell = lambda last_ts: None
         c._read_pywin32 = lambda last_ts: None
         c._read_wevtutil = lambda: None
         return c

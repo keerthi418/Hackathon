@@ -96,9 +96,27 @@ SEVERITY_BY_PRIORITY = {"PRIORITY": "High", "REVIEW": "Medium",
 
 
 def parse_ts(s):
-    """Parse 'YYYY-MM-DD HH:MM:SS' → datetime or None (never raises)."""
+    """Parse flexible timestamp formats → datetime or None (never raises)."""
+    if not s:
+        return None
+    if isinstance(s, datetime):
+        return s
+    s_str = str(s).strip()
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%d",
+        "%d/%m/%Y %H:%M:%S",
+        "%m/%d/%Y %H:%M:%S"
+    ):
+        try:
+            return datetime.strptime(s_str.rstrip("Z"), fmt)
+        except Exception:
+            continue
     try:
-        return datetime.strptime(str(s).strip(), "%Y-%m-%d %H:%M:%S")
+        return datetime.fromisoformat(s_str.replace("Z", "+00:00")).replace(tzinfo=None)
     except Exception:
         return None
 
@@ -139,7 +157,11 @@ def fingerprint(account, computer, event_ids):
 
 
 def _normalize(events):
-    """Filter + normalize raw event dicts. Malformed rows are skipped."""
+    """Filter + normalize raw event dicts. Malformed rows are skipped.
+
+    Windows-specific fields (logon_type, source_ip, source_workstation,
+    auth_package, domain) are preserved for explainable detection.
+    """
     normalized = []
     for e in events:
         if not isinstance(e, dict):
@@ -160,6 +182,12 @@ def _normalize(events):
             "department_case": str(
                 e.get("department_case", e.get("department", ""))
             ),
+            # Windows-specific fields (empty for non-Windows events)
+            "logon_type": str(e.get("logon_type", "")).strip(),
+            "source_ip": str(e.get("source_ip", "")).strip(),
+            "source_workstation": str(e.get("source_workstation", "")).strip(),
+            "auth_package": str(e.get("auth_package", "")).strip(),
+            "domain": str(e.get("domain", "")).strip(),
         })
     return normalized
 
@@ -302,6 +330,11 @@ def _detect_account_computer(evts, account, computer, n, w,
                   if window_start <= f["timestamp"] < e["timestamp"]]
         if len(recent) >= n:
             r1 = True
+            # Collect Windows-specific context for the explanation
+            src_ips = sorted({f.get("source_ip", "") for f in recent
+                             if f.get("source_ip", "")})
+            logon_types = sorted({f.get("logon_type", "") for f in recent
+                                  if f.get("logon_type", "")})
             r1_detail = {
                 "failCount": len(recent),
                 "windowMin": w,
@@ -310,6 +343,10 @@ def _detect_account_computer(evts, account, computer, n, w,
                 "to": format_ts(e["timestamp"]),
                 "successAt": format_ts(e["timestamp"]),
                 "eventIds": [f["event_id"] for f in recent] + [e["event_id"]],
+                "sourceIps": src_ips,
+                "logonTypes": logon_types,
+                "successLogonType": e.get("logon_type", ""),
+                "successSourceIp": e.get("source_ip", ""),
             }
             for f in recent:
                 matched_ids.add(f["event_id"])
@@ -323,6 +360,8 @@ def _detect_account_computer(evts, account, computer, n, w,
                 "eventIds": [e["event_id"]],
                 "openTime": open_time,
                 "closeTime": close_time,
+                "logonType": e.get("logon_type", ""),
+                "sourceIp": e.get("source_ip", ""),
             }
             matched_ids.add(e["event_id"])
 
@@ -591,6 +630,16 @@ def _build_rule_details(triggered, account, computer, details,
                 f"{account} on {computer} between {d.get('from')} and "
                 f"{d.get('to')} were followed by a successful login at "
                 f"{d.get('successAt')}.")
+            # Add Windows-specific context when available
+            src_ips = d.get("sourceIps") or []
+            logon_types = d.get("logonTypes") or []
+            if src_ips:
+                explanation += f" Source IP(s): {', '.join(src_ips)}."
+            if logon_types:
+                explanation += f" Logon type(s): {', '.join(logon_types)}."
+            if d.get("successLogonType"):
+                explanation += (f" Successful logon type: "
+                                f"{d['successLogonType']}.")
             recommendation = RULE_RECOMMENDATIONS["R1"]
             threshold = f"N={d.get('threshold', n)} failures"
             window = f"W={d.get('windowMin', w)} min"
@@ -599,6 +648,10 @@ def _build_rule_details(triggered, account, computer, details,
                 f"A successful login for {account} on {computer} occurred "
                 f"at {d.get('at')}, outside the configured lab hours "
                 f"({d.get('openTime', open_time)}–{d.get('closeTime', close_time)}).")
+            if d.get("logonType"):
+                explanation += f" Logon type: {d['logonType']}."
+            if d.get("sourceIp"):
+                explanation += f" Source IP: {d['sourceIp']}."
             recommendation = RULE_RECOMMENDATIONS["R2"]
             threshold = "outside lab hours"
             window = (f"{d.get('openTime', open_time)}–"
@@ -672,6 +725,98 @@ def _compute_score(triggered):
 
     score = min(100, sum of the weights of the triggered rules)."""
     return min(100, sum(RULE_WEIGHTS.get(r, 0) for r in triggered))
+
+
+def _analyze_indicators(normalized):
+    """Additional security analysis indicators.
+
+    Where the available data supports it, identify potential indicators
+    of suspicious activity. These are NOT proof of an attack — only
+    potential indicators for human investigation.
+
+    Returns a list of indicator dicts with type, severity, detail, and
+    recommendation fields.
+    """
+    indicators = []
+    if not normalized:
+        return indicators
+
+    # Group failures by account
+    failures_by_account = defaultdict(list)
+    successes_by_account = defaultdict(list)
+    for e in normalized:
+        if e["event"] == "Failure":
+            failures_by_account[e["account"]].append(e)
+        elif e["event"] == "Success":
+            successes_by_account[e["account"]].append(e)
+
+    # Detect potential brute-force: many failures for one account
+    for account, fails in failures_by_account.items():
+        if len(fails) >= 5:
+            src_ips = sorted({f.get("source_ip", "") for f in fails
+                             if f.get("source_ip", "")})
+            indicators.append({
+                "type": "potential_bruteforce",
+                "severity": "medium",
+                "detail": (f"{len(fails)} failed logon attempts for account "
+                           f"'{account}'"),
+                "sourceIps": src_ips,
+                "recommendation": ("Verify whether this is legitimate failed "
+                                   "authentication activity or a potential "
+                                   "brute-force attempt."),
+            })
+
+    # Detect potential password spraying: one IP targeting many accounts
+    failures_by_ip = defaultdict(list)
+    for e in normalized:
+        if e["event"] == "Failure" and e.get("source_ip", ""):
+            failures_by_ip[e["source_ip"]].append(e)
+    for ip, fails in failures_by_ip.items():
+        accounts = sorted({f["account"] for f in fails})
+        if len(accounts) >= 3:
+            indicators.append({
+                "type": "potential_password_spray",
+                "severity": "medium",
+                "detail": (f"Source IP {ip} attempted authentication for "
+                           f"{len(accounts)} different accounts"),
+                "accounts": accounts,
+                "recommendation": ("Verify whether this is legitimate "
+                                   "authentication activity or a potential "
+                                   "password spraying attack."),
+            })
+
+    # Detect unusual logon types
+    common_logon_types = {"2", "3", "7", "10"}  # Interactive, Network, Unlock, RemoteInteractive
+    for e in normalized:
+        lt = e.get("logon_type", "")
+        if lt and lt not in common_logon_types and e["event"] == "Success":
+            indicators.append({
+                "type": "unusual_logon_type",
+                "severity": "low",
+                "detail": (f"Successful logon with unusual type {lt} for "
+                           f"account '{e['account']}' on {e['computer']}"),
+                "logonType": lt,
+                "recommendation": ("Verify whether this logon type is "
+                                   "expected for this account and computer."),
+            })
+
+    # Detect new/uncommon source IPs (simplified: IP seen with few events)
+    all_ips = defaultdict(int)
+    for e in normalized:
+        if e.get("source_ip", ""):
+            all_ips[e["source_ip"]] += 1
+    for ip, count in all_ips.items():
+        if count <= 2 and ip not in ("", "-", "::1", "127.0.0.1"):
+            indicators.append({
+                "type": "uncommon_source_ip",
+                "severity": "low",
+                "detail": (f"Source IP {ip} observed only {count} time(s) "
+                           f"in the current data set"),
+                "recommendation": ("Verify whether this source IP is "
+                                   "expected in your environment."),
+            })
+
+    return indicators
 
 
 # ─── Main entry point ──────────────────────────────────────────────

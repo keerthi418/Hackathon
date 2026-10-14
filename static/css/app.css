@@ -752,6 +752,42 @@ body {
   50% { opacity: 0.4; transform: scale(0.8); }
 }
 
+/* ─── Mode banner (Live vs Demo) ─────────────────────────────── */
+.mode-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0.5rem 1rem 0;
+  padding: 0.5rem 1rem;
+  background: rgba(30, 42, 66, 0.6);
+  border: 1px solid rgba(30, 42, 66, 0.8);
+  border-radius: 8px;
+  font-size: 0.85rem;
+}
+
+.mode-indicator {
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  padding: 0.2rem 0.6rem;
+  border-radius: 4px;
+}
+
+.mode-live {
+  color: #4ade80;
+  background: rgba(74, 222, 128, 0.1);
+  border: 1px solid rgba(74, 222, 128, 0.3);
+}
+
+.mode-demo {
+  color: #fbbf24;
+  background: rgba(251, 191, 36, 0.1);
+  border: 1px solid rgba(251, 191, 36, 0.3);
+}
+
+.mode-detail {
+  color: #8b9cb3;
+}
+
 .banner-actions {
   margin-left: auto;
   display: flex;

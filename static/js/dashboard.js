@@ -452,6 +452,29 @@
     }
   }
 
+  // ─── Mode indicator (Live vs Demo) ─────────────────────
+  async function loadMode() {
+    try {
+      const d = await api("/api/mode");
+      const indicator = $("#modeIndicator");
+      const detail = $("#modeDetail");
+      if (d.isLive) {
+        indicator.textContent = "● LIVE MODE";
+        indicator.className = "mode-indicator mode-live";
+        detail.textContent =
+          `${d.liveWindowsEvents} Windows Security events · ` +
+          `collector: ${d.collectorHealthy ? "healthy" : d.collectorStatus}`;
+      } else {
+        indicator.textContent = "○ DEMO MODE";
+        indicator.className = "mode-indicator mode-demo";
+        detail.textContent =
+          `${d.manualEvents} uploaded events · no live Windows collection`;
+      }
+    } catch (e) {
+      console.warn(e);
+    }
+  }
+
   $("#bannerAck").addEventListener("click", async () => {
     try {
       await api("/api/monitor/banner/ack", { method: "POST" });
@@ -464,7 +487,9 @@
   // init
   loadSettings().then(loadDashboard);
   loadBanner();
+  loadMode();
   setInterval(loadBanner, 10000);
+  setInterval(loadMode, 15000);
 
   // deep link: /dashboard?case=<id> opens the case in the evidence panel
   const caseParam = new URLSearchParams(window.location.search).get("case");
